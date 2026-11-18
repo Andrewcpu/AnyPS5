@@ -89,6 +89,23 @@ constexpr Wrapper kWrappers[] = {
     {"sceKernelGetProcessTime", WasmImportKind::ProcessTime},
     {"anyps5_webgpu_submit", WasmImportKind::Graphics},
     {"puts", WasmImportKind::Puts},
+    {"__error", WasmImportKind::Error},
+    {"strerror", WasmImportKind::Strerror},
+    {"snprintf", WasmImportKind::Snprintf},
+    {"vsnprintf", WasmImportKind::Vsnprintf},
+    {"fmodf", WasmImportKind::Fmodf},
+    {"sceSystemServiceHideSplashScreen", WasmImportKind::Splash},
+    {"sceKernelAllocateMainDirectMemory", WasmImportKind::DirectAlloc},
+    {"sceKernelMapDirectMemory", WasmImportKind::DirectMap},
+    {"sceKernelCreateEqueue", WasmImportKind::EqueueCreate},
+    {"sceKernelWaitEqueue", WasmImportKind::EqueueWait},
+    {"sceVideoOutOpen", WasmImportKind::VideoOpen},
+    {"sceVideoOutGetOutputStatus", WasmImportKind::VideoStatus},
+    {"sceVideoOutAddFlipEvent", WasmImportKind::VideoFlipEvent},
+    {"sceVideoOutSetFlipRate", WasmImportKind::VideoFlipRate},
+    {"sceVideoOutSetBufferAttribute2", WasmImportKind::VideoAttribute},
+    {"sceVideoOutRegisterBuffers2", WasmImportKind::VideoRegister},
+    {"sceVideoOutSubmitFlip", WasmImportKind::VideoSubmit},
 };
 
 std::uint16_t Lookup(const std::string& key, bool qualified, bool hashPlain) {

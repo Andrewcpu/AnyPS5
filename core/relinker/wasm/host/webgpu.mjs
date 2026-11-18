@@ -1,8 +1,10 @@
 export const kCommandBytes = 20;
 export const kClearOpcode = 1;
 export const kDrawOpcode = 2;
+export const kPresentOpcode = 3;
 export const kConstantColor = 1;
 export const kMaxExtent = 256;
+export const kPresentMax = 3840;
 
 const kConstantColorWgsl = [
     'struct Anyps5Color { value: vec4f }',
@@ -18,6 +20,19 @@ const kConstantColorWgsl = [
     '}',
 ].join('\n');
 
+const kPresentWgsl = [
+    '@group(0) @binding(0) var anyps5_frame: texture_2d<f32>;',
+    '@vertex',
+    'fn vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {',
+    '  var positions = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));',
+    '  return vec4f(positions[index], 0.0, 1.0);',
+    '}',
+    '@fragment',
+    'fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {',
+    '  return textureLoad(anyps5_frame, vec2i(pos.xy), 0);',
+    '}',
+].join('\n');
+
 export function translateShader(form) {
     if (form !== kConstantColor) throw new Error('wasm: unknown webgpu shader form ' + form);
     return kConstantColorWgsl;
@@ -29,16 +44,22 @@ export function parseCommand(bytes) {
     const opcode = view.getUint32(0, true);
     const width = view.getUint32(4, true);
     const height = view.getUint32(8, true);
-    const rgba = view.getUint32(12, true);
-    const shader = view.getUint32(16, true);
+    const fourth = view.getUint32(12, true);
+    const fifth = view.getUint32(16, true);
+    if (opcode === kPresentOpcode) {
+        if (width < 1 || width > kPresentMax || height < 1 || height > kPresentMax) throw new Error('wasm: webgpu extent ' + width + 'x' + height);
+        const stride = fifth === 0 ? width * 4 : fifth;
+        if (stride < width * 4) throw new Error('wasm: webgpu stride ' + stride);
+        return { opcode, width, height, offset: fourth, stride, rgba: 0, shader: 0 };
+    }
     if (width < 1 || width > kMaxExtent || height < 1 || height > kMaxExtent) throw new Error('wasm: webgpu extent ' + width + 'x' + height);
     if (opcode === kClearOpcode) {
-        if (shader !== 0) throw new Error('wasm: unknown webgpu shader form ' + shader);
-        return { opcode, width, height, rgba, shader };
+        if (fifth !== 0) throw new Error('wasm: unknown webgpu shader form ' + fifth);
+        return { opcode, width, height, rgba: fourth, shader: fifth };
     }
     if (opcode === kDrawOpcode) {
-        translateShader(shader);
-        return { opcode, width, height, rgba, shader };
+        translateShader(fifth);
+        return { opcode, width, height, rgba: fourth, shader: fifth };
     }
     throw new Error('wasm: unknown webgpu opcode ' + opcode);
 }
@@ -69,7 +90,9 @@ export async function createWebGpuService(gpu, canvas) {
     let pending = null;
     let rejection = '';
     const pipelines = new Map();
+    const blits = new Map();
     const binds = new WeakMap();
+    const staging = [];
     function uniformBuffer() {
         if (!uniform) uniform = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         return uniform;
@@ -85,6 +108,19 @@ export async function createWebGpuService(gpu, canvas) {
             primitive: { topology: 'triangle-list' },
         });
         pipelines.set(format, pipeline);
+        return pipeline;
+    }
+    function blitFor(format) {
+        const found = blits.get(format);
+        if (found) return found;
+        const module = device.createShaderModule({ code: kPresentWgsl });
+        const pipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: { module, entryPoint: 'vs' },
+            fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+            primitive: { topology: 'triangle-list' },
+        });
+        blits.set(format, pipeline);
         return pipeline;
     }
     function bindFor(pipeline) {
@@ -105,7 +141,7 @@ export async function createWebGpuService(gpu, canvas) {
         texture = device.createTexture({
             size: [width, height, 1],
             format: 'rgba8unorm',
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
         });
         return texture;
     }
@@ -132,7 +168,23 @@ export async function createWebGpuService(gpu, canvas) {
         canvas.height = pending.height;
         context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
         const encoder = device.createCommandEncoder();
-        draw(encoder, context.getCurrentTexture().createView(), canvasFormat, pending.color, pending.shaded);
+        const canvasView = context.getCurrentTexture().createView();
+        if (pending.copied) {
+            const pipeline = blitFor(canvasFormat);
+            const group = device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(0),
+                entries: [{ binding: 0, resource: texture.createView() }],
+            });
+            const pass = encoder.beginRenderPass({
+                colorAttachments: [{ view: canvasView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
+            });
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, group);
+            pass.draw(3);
+            pass.end();
+        } else {
+            draw(encoder, canvasView, canvasFormat, pending.color, pending.shaded);
+        }
         device.queue.submit([encoder.finish()]);
         return true;
     }
@@ -156,13 +208,32 @@ export async function createWebGpuService(gpu, canvas) {
         submit(memory, ptr, len) {
             try {
                 const command = parseCommand(new DataView(memory.buffer, ptr, len));
+                if (command.opcode === kPresentOpcode) {
+                    const bytes = command.stride * command.height;
+                    if (command.offset > memory.buffer.byteLength || bytes > memory.buffer.byteLength - command.offset) throw new Error('wasm: webgpu present range');
+                    const aligned = Math.ceil((command.width * 4) / 256) * 256;
+                    const padded = new Uint8Array(aligned * command.height);
+                    const source = new Uint8Array(memory.buffer, command.offset, bytes);
+                    const row = command.width * 4;
+                    for (let y = 0; y < command.height; y++) padded.set(source.subarray(y * command.stride, y * command.stride + row), y * aligned);
+                    const buffer = device.createBuffer({ size: padded.byteLength, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+                    device.queue.writeBuffer(buffer, 0, padded);
+                    staging.push(buffer);
+                    if (staging.length > 2) staging.shift().destroy();
+                    const encoder = device.createCommandEncoder();
+                    encoder.copyBufferToTexture({ buffer, bytesPerRow: aligned, rowsPerImage: command.height }, { texture: target(command.width, command.height) }, { width: command.width, height: command.height });
+                    device.queue.submit([encoder.finish()]);
+                    pending = { width: command.width, height: command.height, color: [0, 0, 0, 0], shaded: false, copied: true };
+                    rejection = '';
+                    return 0;
+                }
                 const color = unpack(command.rgba);
                 const shaded = command.opcode === kDrawOpcode;
                 if (shaded) device.queue.writeBuffer(uniformBuffer(), 0, new Float32Array(color));
                 const encoder = device.createCommandEncoder();
                 draw(encoder, target(command.width, command.height).createView(), 'rgba8unorm', color, shaded);
                 device.queue.submit([encoder.finish()]);
-                pending = { width: command.width, height: command.height, color, shaded };
+                pending = { width: command.width, height: command.height, color, shaded, copied: false };
                 rejection = '';
                 return 0;
             } catch (error) {

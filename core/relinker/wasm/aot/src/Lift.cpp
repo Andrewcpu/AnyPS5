@@ -1,5 +1,6 @@
 #include <wasm/Emit.hpp>
 #include <algorithm>
+#include <stdexcept>
 #include <string>
 
 namespace Relinker::Wasm {
@@ -303,8 +304,12 @@ public:
         const auto wrap = Icmp("ult", end, address);
         const auto below = Icmp("ult", address, Const(guestBase));
         const auto above = Icmp("ugt", end, Const(guestLimit));
-        const auto low = BitOp("or", wrap, below);
-        const auto bad = BitOp("or", low, above);
+        const auto image = BitOp("or", BitOp("or", wrap, below), above);
+        const auto directEnd = Load("i64", "inttoptr (i32 " + std::to_string(kScratchAddress + kHostDirectEnd) + " to ptr)");
+        const auto heapBelow = Icmp("ult", address, Const(guestBase + kMemoryBytes));
+        const auto heapAbove = Icmp("ugt", end, directEnd);
+        const auto outside = BitOp("or", BitOp("or", wrap, heapBelow), heapAbove);
+        const auto bad = BitOp("and", image, outside);
         const auto ok = "ok" + std::to_string(label++);
         Line("br i1 " + bad + ", label %fault, label %" + ok);
         Label(ok);
@@ -665,10 +670,190 @@ void EmitDiv(Ir& ir, Locals& locals, const WasmInsn& insn) {
     locals.Write(2, rem);
 }
 
+void EmitIdiv(Ir& ir, Locals& locals, const WasmInsn& insn) {
+    if (insn.Width != 32) throw std::invalid_argument("wasm: 64-bit IDIV is not lifted");
+    const auto divisor = ir.Sext64(ir.Trunc32(Mask(ir, LoadOperand(ir, locals, insn, insn.Dst, 32), 32)));
+    const auto lo = Mask(ir, locals.Read(0), 32);
+    const auto hi = Mask(ir, locals.Read(2), 32);
+    const auto dividend = ir.Or(ir.Bin("shl", hi, ir.Const(32)), lo);
+    const auto zero = ir.Icmp("eq", divisor, ir.Const(0));
+    const auto minv = ir.Const(0x8000000000000000ull);
+    const auto overflow = ir.BitOp("and", ir.Icmp("eq", dividend, minv), ir.Icmp("eq", divisor, ir.Const(~std::uint64_t{0})));
+    ir.StoreRip(ir.Const(insn.Address));
+    const auto divOk = ir.NextLabel("idiv");
+    ir.Line("br i1 " + ir.BitOp("or", zero, overflow) + ", label %fault, label %" + divOk);
+    ir.Label(divOk);
+    const auto quot = ir.Temp();
+    const auto rem = ir.Temp();
+    ir.Line(quot + " = sdiv i64 " + dividend + ", " + divisor);
+    ir.Line(rem + " = srem i64 " + dividend + ", " + divisor);
+    const auto fits = ir.Icmp("eq", ir.Sext64(ir.Trunc32(quot)), quot);
+    const auto fit = ir.NextLabel("idiv");
+    ir.Line("br i1 " + fits + ", label %" + fit + ", label %fault");
+    ir.Label(fit);
+    locals.Write(0, ir.Zext64(ir.Trunc32(quot)));
+    locals.Write(2, ir.Zext64(ir.Trunc32(rem)));
+}
+
+std::string AsFloat(Ir& ir, const std::string& bits) {
+    const auto name = ir.Temp();
+    ir.Line(name + " = bitcast i32 " + ir.Trunc32(bits) + " to float");
+    return name;
+}
+
+std::string FromFloat(Ir& ir, const std::string& value) {
+    const auto bits = ir.Temp();
+    ir.Line(bits + " = bitcast float " + value + " to i32");
+    return ir.Zext64(bits);
+}
+
+std::string FloatConst(Ir& ir, std::uint32_t bits) {
+    const auto name = ir.Temp();
+    ir.Line(name + " = bitcast i32 " + std::to_string(bits) + " to float");
+    return name;
+}
+
+void StoreScalar(Ir& ir, int reg, const std::string& low, const std::string& high) {
+    ir.StoreXmm(reg, 0, low);
+    ir.StoreXmm(reg, 1, high);
+}
+
+void EmitMovss(Ir& ir, Locals& locals, const WasmInsn& insn) {
+    if (insn.Dst.Kind == WasmOperandKind::Mem) {
+        StoreOperand(ir, locals, insn, insn.Dst, LoadOperand(ir, locals, insn, insn.Src, 32), 32);
+        return;
+    }
+    auto value = Mask(ir, LoadOperand(ir, locals, insn, insn.Src, 32), 32);
+    if (insn.Src.Kind == WasmOperandKind::Mem) {
+        StoreScalar(ir, insn.Dst.Reg, value, ir.Const(0));
+        return;
+    }
+    const auto kept = ir.And(ir.LoadXmm(insn.Cc, 0), ir.Const(~std::uint64_t{0xffffffffull}));
+    StoreScalar(ir, insn.Dst.Reg, ir.Or(kept, value), ir.LoadXmm(insn.Cc, 1));
+}
+
+void EmitMovaps(Ir& ir, Locals& locals, const WasmInsn& insn) {
+    std::string low;
+    std::string high;
+    LoadXmmPair(ir, locals, insn, insn.Src, low, high);
+    if (insn.Dst.Xmm) {
+        StoreScalar(ir, insn.Dst.Reg, low, high);
+        return;
+    }
+    const auto address = AddressOf(ir, locals, insn, insn.Dst);
+    StoreMem(ir, locals, address, low, 64, insn.Address);
+    StoreMem(ir, locals, ir.Add(address, ir.Const(8)), high, 64, insn.Address);
+}
+
+void EmitFloatBinary(Ir& ir, Locals& locals, const WasmInsn& insn, const char* operation) {
+    const auto left = AsFloat(ir, ir.LoadXmm(insn.Cc, 0));
+    const auto right = AsFloat(ir, LoadOperand(ir, locals, insn, insn.Src, 32));
+    const auto value = ir.Temp();
+    ir.Line(value + " = " + std::string(operation) + " float " + left + ", " + right);
+    StoreScalar(ir, insn.Dst.Reg, FromFloat(ir, value), ir.Const(0));
+}
+
+void EmitFloatFromInt(Ir& ir, Locals& locals, const WasmInsn& insn) {
+    const auto source = LoadOperand(ir, locals, insn, insn.Src, insn.Width);
+    const auto value = ir.Temp();
+    if (insn.Width == 32) ir.Line(value + " = sitofp i32 " + ir.Trunc32(source) + " to float");
+    else ir.Line(value + " = sitofp i64 " + source + " to float");
+    const auto kept = ir.And(ir.LoadXmm(insn.Cc, 0), ir.Const(~std::uint64_t{0xffffffffull}));
+    StoreScalar(ir, insn.Dst.Reg, ir.Or(kept, FromFloat(ir, value)), ir.LoadXmm(insn.Cc, 1));
+}
+
+std::string TruncFloat(Ir& ir, const std::string& value, int width) {
+    const auto highBits = width == 32 ? 0x4f000000u : 0x5f000000u;
+    const auto lowBits = width == 32 ? 0xcf000000u : 0xdf000000u;
+    const auto high = ir.Temp();
+    const auto low = ir.Temp();
+    const auto unordered = ir.Temp();
+    ir.Line(high + " = fcmp oge float " + value + ", " + FloatConst(ir, highBits));
+    ir.Line(low + " = fcmp olt float " + value + ", " + FloatConst(ir, lowBits));
+    ir.Line(unordered + " = fcmp uno float " + value + ", " + value);
+    const auto bad = ir.BitOp("or", ir.BitOp("or", high, low), unordered);
+    if (width == 32) {
+        const auto converted = ir.Temp();
+        ir.Line(converted + " = fptosi float " + value + " to i32");
+        const auto picked = ir.Temp();
+        ir.Line(picked + " = select i1 " + bad + ", i32 -2147483648, i32 " + converted);
+        return ir.Zext64(picked);
+    }
+    const auto converted = ir.Temp();
+    ir.Line(converted + " = fptosi float " + value + " to i64");
+    const auto indefinite = ir.Bin("shl", ir.Const(1), ir.Const(63));
+    return ir.Select(bad, indefinite, converted);
+}
+
+void EmitFloatToInt(Ir& ir, Locals& locals, const WasmInsn& insn) {
+    const auto value = AsFloat(ir, LoadOperand(ir, locals, insn, insn.Src, 32));
+    StoreOperand(ir, locals, insn, insn.Dst, TruncFloat(ir, value, insn.Width), insn.Width);
+}
+
+void EmitFloatCmp(Ir& ir, Locals& locals, const WasmInsn& insn, bool deadFlags) {
+    const auto left = AsFloat(ir, LoadOperand(ir, locals, insn, insn.Dst, 32));
+    const auto right = AsFloat(ir, LoadOperand(ir, locals, insn, insn.Src, 32));
+    if (deadFlags) return;
+    const auto less = ir.Temp();
+    const auto equal = ir.Temp();
+    const auto unordered = ir.Temp();
+    ir.Line(less + " = fcmp olt float " + left + ", " + right);
+    ir.Line(equal + " = fcmp oeq float " + left + ", " + right);
+    ir.Line(unordered + " = fcmp uno float " + left + ", " + right);
+    const auto carry = ir.Select(ir.BitOp("or", unordered, less), ir.Const(1), ir.Const(0));
+    const auto parity = ir.Select(unordered, ir.Const(4), ir.Const(0));
+    const auto zero = ir.Select(ir.BitOp("or", unordered, equal), ir.Const(64), ir.Const(0));
+    locals.WriteFlags(ir.Or(ir.Or(ir.Or(ir.Const(kInitialFlags), carry), parity), zero));
+}
+
+void EmitFloat(Ir& ir, Locals& locals, const WasmInsn& insn, bool deadFlags) {
+    if (insn.Extra == kFloatMovss) EmitMovss(ir, locals, insn);
+    else if (insn.Extra == kFloatMovaps) EmitMovaps(ir, locals, insn);
+    else if (insn.Extra == kFloatAdd) EmitFloatBinary(ir, locals, insn, "fadd");
+    else if (insn.Extra == kFloatSub) EmitFloatBinary(ir, locals, insn, "fsub");
+    else if (insn.Extra == kFloatMul) EmitFloatBinary(ir, locals, insn, "fmul");
+    else if (insn.Extra == kFloatDiv) EmitFloatBinary(ir, locals, insn, "fdiv");
+    else if (insn.Extra == kFloatFromInt) EmitFloatFromInt(ir, locals, insn);
+    else if (insn.Extra == kFloatToInt) EmitFloatToInt(ir, locals, insn);
+    else if (insn.Extra == kFloatCmp) EmitFloatCmp(ir, locals, insn, deadFlags);
+    else throw std::invalid_argument("wasm: float operation");
+}
+
+void EmitSyscall(Ir& ir, Locals& locals, const WasmInsn& insn) {
+    locals.Spill();
+    ir.StoreRip(ir.Const(insn.Address));
+    const auto status = ir.Temp();
+    ir.Line(status + " = call i32 @anyps5_host_call(i32 " + std::to_string(kHostSyscall) + ", i64 " + locals.Read(7) + ", i64 " + locals.Read(6) + ", i64 " + locals.Read(2) + ", i64 " + locals.Read(10) + ", i64 " + locals.Read(8) + ", i64 " + locals.Read(9) + ", i64 " + locals.Read(4) + ", i64 " + locals.Read(0) + ")");
+    const auto bad = ir.Icmp("ne", status, "0", "i32");
+    const auto back = ir.NextLabel("syscall");
+    ir.Line("br i1 " + bad + ", label %fault, label %" + back);
+    ir.Label(back);
+    locals.Write(0, ir.Load("i64", "inttoptr (i32 " + std::to_string(kScratchAddress + kHostResult) + " to ptr)"));
+}
+
 void EmitInsn(Ir& ir, Locals& locals, const WasmInsn& insn, bool deadFlags) {
     switch (insn.Op) {
     case WasmMnemonic::Nop:
         return;
+    case WasmMnemonic::Movzx:
+    case WasmMnemonic::Movsx: {
+        auto value = Mask(ir, LoadOperand(ir, locals, insn, insn.Src, static_cast<int>(insn.Extra)), static_cast<int>(insn.Extra));
+        if (insn.Op == WasmMnemonic::Movsx) {
+            const auto bits = ir.Temp();
+            ir.Line(bits + " = trunc i64 " + value + " to i8");
+            if (insn.Width == 64) {
+                const auto wide = ir.Temp();
+                ir.Line(wide + " = sext i8 " + bits + " to i64");
+                value = wide;
+            } else {
+                const auto wide = ir.Temp();
+                ir.Line(wide + " = sext i8 " + bits + " to i32");
+                value = ir.Zext64(wide);
+            }
+        }
+        StoreOperand(ir, locals, insn, insn.Dst, value, 64);
+        return;
+    }
     case WasmMnemonic::Mov:
     case WasmMnemonic::MovImm:
     case WasmMnemonic::Lea:
@@ -709,6 +894,15 @@ void EmitInsn(Ir& ir, Locals& locals, const WasmInsn& insn, bool deadFlags) {
     case WasmMnemonic::Div:
         EmitDiv(ir, locals, insn);
         return;
+    case WasmMnemonic::Idiv:
+        EmitIdiv(ir, locals, insn);
+        return;
+    case WasmMnemonic::Cqo: {
+        const auto rax = locals.Read(0);
+        if (insn.Width == 64) locals.Write(2, ir.Bin("ashr", rax, ir.Const(63)));
+        else locals.Write(2, ir.Zext64(ir.Trunc32(ir.Lshr(ir.Sext64(ir.Trunc32(rax)), ir.Const(32)))));
+        return;
+    }
     case WasmMnemonic::Setcc: {
         const auto bit = ir.Select(Condition(ir, insn.Cc, locals.ReadFlags()), ir.Const(1), ir.Const(0));
         StoreOperand(ir, locals, insn, insn.Dst, bit, 8);
@@ -755,6 +949,12 @@ void EmitInsn(Ir& ir, Locals& locals, const WasmInsn& insn, bool deadFlags) {
     case WasmMnemonic::Pxor:
         EmitXmm(ir, locals, insn);
         return;
+    case WasmMnemonic::Float:
+        EmitFloat(ir, locals, insn, deadFlags);
+        return;
+    case WasmMnemonic::Syscall:
+        EmitSyscall(ir, locals, insn);
+        return;
     case WasmMnemonic::Jmp:
     case WasmMnemonic::Jcc:
     case WasmMnemonic::Call:
@@ -787,6 +987,8 @@ bool WritesFlags(const WasmInsn& insn) {
     case WasmMnemonic::Imul:
     case WasmMnemonic::Imul3:
         return true;
+    case WasmMnemonic::Float:
+        return insn.Extra == kFloatCmp;
     default:
         return false;
     }
@@ -1078,6 +1280,11 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
     module += kShiftFlags;
     module += kDiv;
     module += EmitWasmImports(image);
+    bool syscall = false;
+    for (const auto& block : blocks) {
+        for (const auto& instruction : block.Insns) syscall = syscall || instruction.Op == WasmMnemonic::Syscall;
+    }
+    if (syscall && !WasmUsesHost(image)) module += WasmHostDeclare(WasmHostGroup(image));
     module += "\ndefine i32 @anyps5_run() {\nentry:\n";
     Ir ir(image.GuestBase, image.GuestLimit);
     const auto span = static_cast<std::uint32_t>(image.GuestLimit - image.GuestBase);
@@ -1097,6 +1304,7 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
     ir.StoreGpr(kRsp, ir.Const(image.StackTop));
     ir.StoreRip(ir.Const(image.Entry));
     ir.StoreFlags(ir.Const(kInitialFlags));
+    ir.Store("i64", ir.Const(image.GuestBase + kInitialMemory), "inttoptr (i32 " + std::to_string(kScratchAddress + kHostDirectEnd) + " to ptr)");
     if (WasmImportsUse(image, WasmImportKind::ProcessTime)) {
         const auto now = ir.Temp();
         ir.Line(now + " = call i64 @anyps5_host_monotonic_us()");

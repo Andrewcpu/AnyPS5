@@ -1,19 +1,25 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { createServer as createNet } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { kClearOpcode, kCommandBytes, kConstantColor, kDrawOpcode, kMaxExtent, parseCommand, translateShader } from './webgpu.mjs';
+import { kClearOpcode, kCommandBytes, kConstantColor, kDrawOpcode, kMaxExtent, kPresentMax, kPresentOpcode, parseCommand, translateShader } from './webgpu.mjs';
 
 const hostPath = fileURLToPath(new URL('./webgpu.mjs', import.meta.url));
 
 function fail(message) {
+    const error = new Error(message);
+    error.reported = true;
     console.error(message);
-    process.exit(1);
+    throw error;
+}
+
+function note(chunks, text) {
+    chunks.push(text);
+    while (chunks.length > 1 && chunks.join('').length > 4000) chunks.shift();
 }
 
 function command(opcode, width, height, rgba, shader) {
@@ -52,18 +58,22 @@ function check() {
     expectThrow('webgpu extent', () => parseCommand(command(kClearOpcode, 0, 2, 0xff0000ff, 0)));
     expectThrow('webgpu extent', () => parseCommand(command(kDrawOpcode, 1, kMaxExtent + 1, 0xffff0000, kConstantColor)));
     expectThrow('webgpu command size', () => parseCommand(command(kClearOpcode, 2, 2, 0xff0000ff, 0).slice(0, 19)));
+    const present = parseCommand(command(kPresentOpcode, kPresentMax, 2, 128, 0));
+    if (present.opcode !== kPresentOpcode || present.width !== kPresentMax || present.offset !== 128 || present.stride !== kPresentMax * 4) fail('present command');
+    expectThrow('webgpu extent', () => parseCommand(command(kPresentOpcode, kPresentMax + 1, 1, 0, 0)));
+    expectThrow('webgpu stride', () => parseCommand(command(kPresentOpcode, 2, 2, 0, 4)));
     console.log('ok');
 }
 
-function freePort() {
-    return new Promise((resolve, reject) => {
-        const server = createNet();
-        server.once('error', reject);
-        server.listen(0, '127.0.0.1', () => {
-            const { port } = server.address();
-            server.close(() => resolve(port));
-        });
-    });
+async function chromeCommand(command) {
+    try {
+        const path = await realpath(command);
+        const direct = join(dirname(path), 'chrome');
+        await access(direct, constants.X_OK);
+        return direct;
+    } catch {
+        return command;
+    }
 }
 
 async function chromeProfile() {
@@ -82,6 +92,69 @@ async function chromeProfile() {
         return { profile: await mkdtemp(prefix), temp: root };
     }
     fail('chrome profile path is too long for a unix socket');
+}
+
+async function openChrome(binary) {
+    let reported = 'chrome did not open a debugging port';
+    for (let launch = 0; launch < 2; launch += 1) {
+        const { profile, temp } = await chromeProfile();
+        const log = [];
+        const child = spawn(binary, [
+            '--headless=new',
+            '--enable-unsafe-webgpu',
+            '--no-sandbox',
+            '--disable-gpu-sandbox',
+            '--no-first-run',
+            '--disable-sync',
+            '--disable-breakpad',
+            '--disable-dev-shm-usage',
+            '--user-data-dir=' + profile,
+            '--remote-debugging-port=0',
+            '--remote-allow-origins=*',
+            'about:blank',
+        ], {
+            stdio: ['ignore', 'ignore', 'pipe'],
+            detached: true,
+            env: {
+                ...process.env,
+                TMPDIR: temp,
+                TEMP: temp,
+                TMP: temp,
+                DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/aps5-no-bus',
+                DBUS_SYSTEM_BUS_ADDRESS: 'unix:path=/tmp/aps5-no-bus',
+            },
+        });
+        child.stderr.on('data', (chunk) => note(log, chunk.toString()));
+        let exited = null;
+        child.once('exit', (code, signal) => { exited = code ?? signal; });
+        const stop = () => {
+            try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+        };
+        let version = null;
+        let port = 0;
+        try {
+            for (let attempt = 0; attempt < 100 && version == null && exited == null; attempt += 1) {
+                try {
+                    port = Number((await readFile(join(profile, 'DevToolsActivePort'), 'utf8')).split('\n')[0]);
+                    if (port > 0) {
+                        const response = await fetch('http://127.0.0.1:' + port + '/json/version');
+                        if (response.ok) version = await response.json();
+                    }
+                } catch {
+                }
+                if (version == null) await delay(100);
+            }
+        } catch (error) {
+            stop();
+            await rm(profile, { recursive: true, force: true });
+            throw error;
+        }
+        if (version) return { port, stop, profile, log };
+        stop();
+        await rm(profile, { recursive: true, force: true });
+        reported = 'chrome did not open a debugging port' + (exited == null ? '' : ' exit ' + exited) + '\n' + log.join('');
+    }
+    fail(reported);
 }
 
 async function browser(chrome, wasmPath) {
@@ -129,49 +202,10 @@ document.getElementById('out').textContent = window.result;
     });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const httpPort = server.address().port;
-    const debugPort = await freePort();
-    const { profile, temp } = await chromeProfile();
-    const chromeLog = [];
-    const child = spawn(chrome, [
-        '--headless=new',
-        '--enable-unsafe-webgpu',
-        '--no-sandbox',
-        '--disable-gpu-sandbox',
-        '--no-first-run',
-        '--disable-sync',
-        '--disable-dev-shm-usage',
-        '--user-data-dir=' + profile,
-        '--remote-debugging-port=' + debugPort,
-        '--remote-allow-origins=*',
-        'about:blank',
-    ], {
-        stdio: ['ignore', 'ignore', 'pipe'],
-        detached: true,
-        env: { ...process.env, TMPDIR: temp, TEMP: temp, TMP: temp },
-    });
-    child.stderr.on('data', (chunk) => {
-        chromeLog.push(chunk.toString());
-        if (chromeLog.join('').length > 4000) chromeLog.splice(0, chromeLog.length - 4);
-    });
-    const stop = () => {
-        try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
-        server.close();
-    };
+    let opened = null;
     try {
-        let version = null;
-        for (let attempt = 0; attempt < 50; attempt += 1) {
-            try {
-                const response = await fetch('http://127.0.0.1:' + debugPort + '/json/version');
-                if (response.ok) {
-                    version = await response.json();
-                    break;
-                }
-            } catch {
-            }
-            await delay(200);
-        }
-        if (!version) fail('chrome did not open a debugging port\n' + chromeLog.join(''));
-        const created = await fetch('http://127.0.0.1:' + debugPort + '/json/new?http://127.0.0.1:' + httpPort + '/', { method: 'PUT' });
+        opened = await openChrome(await chromeCommand(chrome));
+        const created = await fetch('http://127.0.0.1:' + opened.port + '/json/new?http://127.0.0.1:' + httpPort + '/', { method: 'PUT' });
         const target = await created.json();
         const socket = new WebSocket(target.webSocketDebuggerUrl);
         await new Promise((resolve, reject) => {
@@ -200,15 +234,23 @@ document.getElementById('out').textContent = window.result;
             if (text) break;
         }
         socket.close();
-        if (!text) fail('webgpu page produced no result\n' + logs.join('\n') + '\n' + chromeLog.join(''));
+        if (!text) fail('webgpu page produced no result\n' + logs.join('\n') + '\n' + opened.log.join(''));
         console.log(text);
     } finally {
-        stop();
-        await rm(profile, { recursive: true, force: true });
+        if (opened) {
+            opened.stop();
+            await rm(opened.profile, { recursive: true, force: true });
+        }
+        server.close();
     }
 }
 
-const mode = process.argv[2];
-if (mode === 'check') check();
-else if (mode === 'browser') await browser(process.argv[3], process.argv[4]);
-else fail('usage: run.mjs check | run.mjs browser <chrome> <guest.wasm>');
+try {
+    const mode = process.argv[2];
+    if (mode === 'check') check();
+    else if (mode === 'browser') await browser(process.argv[3], process.argv[4]);
+    else fail('usage: run.mjs check | run.mjs browser <chrome> <guest.wasm>');
+} catch (error) {
+    if (!error.reported) console.error(error && error.stack ? error.stack : error);
+    process.exit(1);
+}
