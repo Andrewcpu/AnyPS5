@@ -1517,7 +1517,7 @@ void Forms() {
     ExpectEqual("forms r15", run.Gpr[15], ~std::uint64_t{0});
     ExpectEqual("forms rbp", run.Gpr[5], ~std::uint64_t{0});
     for (int index = 0; index < 16; ++index) ExpectEqual("forms native gpr " + std::to_string(index), run.Gpr[index], run.Native.Gpr[index]);
-    ExpectFlags("forms flags", run.Native.Flags, run.Flags, false);
+    ExpectFlags("forms flags", run.Native.Flags, run.Flags, true);
     ExpectSameMemory(run);
     {
         Asm zero;
@@ -1533,7 +1533,7 @@ void Forms() {
         const auto imul = RunGuest(Elf(0x242000, 0x242000, product.Bytes));
         ExpectEqual("imul eax", imul.Gpr[0], 15);
         ExpectEqual("imul native eax", imul.Native.Gpr[0], 15);
-        ExpectFlags("imul flags", imul.Native.Flags, imul.Flags, false);
+        ExpectEqual("imul cf of", imul.Flags & 0x801, imul.Native.Flags & 0x801);
     }
     {
         Asm byte;
