@@ -445,6 +445,8 @@ void EmitInsn(Ir& ir, const WasmInsn& insn) {
     case WasmMnemonic::Jmp:
     case WasmMnemonic::Jcc:
     case WasmMnemonic::Call:
+    case WasmMnemonic::CallSlot:
+    case WasmMnemonic::JmpSlot:
     case WasmMnemonic::Ret:
     case WasmMnemonic::Halt:
         return;
@@ -499,6 +501,11 @@ std::string MemoryHelpers(std::uint64_t guestBase) {
     text += "  %ptr = inttoptr i32 %wasm to ptr\n";
     text += "  %value = load i64, ptr %ptr, align 1\n";
     text += "  ret i64 %value\n}\n";
+    text += "define internal i32 @anyps5_read8(i32 %wasm) {\n";
+    text += "  %ptr = inttoptr i32 %wasm to ptr\n";
+    text += "  %value = load i8, ptr %ptr, align 1\n";
+    text += "  %wide = zext i8 %value to i32\n";
+    text += "  ret i32 %wide\n}\n";
     text += "define internal void @anyps5_write32(i32 %wasm, i32 %value) {\n";
     text += "  %ptr = inttoptr i32 %wasm to ptr\n";
     text += "  store i32 %value, ptr %ptr, align 1\n";
@@ -506,6 +513,11 @@ std::string MemoryHelpers(std::uint64_t guestBase) {
     text += "define internal void @anyps5_write64(i32 %wasm, i64 %value) {\n";
     text += "  %ptr = inttoptr i32 %wasm to ptr\n";
     text += "  store i64 %value, ptr %ptr, align 1\n";
+    text += "  ret void\n}\n";
+    text += "define internal void @anyps5_write8(i32 %wasm, i32 %value) {\n";
+    text += "  %ptr = inttoptr i32 %wasm to ptr\n";
+    text += "  %byte = trunc i32 %value to i8\n";
+    text += "  store i8 %byte, ptr %ptr, align 1\n";
     text += "  ret void\n}\n";
     return text;
 }
@@ -540,6 +552,7 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
     }
     module += MemoryHelpers(image.GuestBase);
     module += kFlags;
+    module += EmitWasmImports(image);
     module += "\ndefine i32 @anyps5_run() {\nentry:\n";
     Ir ir(image.GuestBase, image.GuestLimit);
     const auto span = static_cast<std::uint32_t>(image.GuestLimit - image.GuestBase);
@@ -559,6 +572,11 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
     ir.StoreGpr(kRsp, ir.Const(image.StackTop));
     ir.StoreRip(ir.Const(image.Entry));
     ir.StoreFlags(ir.Const(kInitialFlags));
+    if (WasmImportsUse(image, WasmImportKind::ProcessTime)) {
+        const auto now = ir.Temp();
+        ir.Line(now + " = call i64 @anyps5_host_monotonic_us()");
+        ir.Line("store i64 " + now + ", ptr @anyps5_time_origin, align 8");
+    }
     ir.Line("store i32 0, ptr @anyps5_steps, align 4");
     ir.Branch("dispatch");
     ir.Label("dispatch");
@@ -573,11 +591,19 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
     const auto rip = ir.Load("i64", ir.StatePtr(kRipOffset));
     ir.Text += "  switch i64 " + rip + ", label %missing [\n";
     for (const auto& block : blocks) ir.Text += "    i64 " + Number(block.Start) + ", label %g" + Hex(block.Start) + "\n";
+    for (std::size_t index = 0; index < image.Imports.size(); ++index) ir.Text += "    i64 " + Number(image.Imports[index].Entry) + ", label %i" + std::to_string(index) + "\n";
     ir.Text += "  ]\n";
     for (const auto& block : blocks) {
         ir.Label("g" + Hex(block.Start));
         for (const auto& insn : block.Insns) EmitInsn(ir, insn);
         EmitEdge(ir, block);
+    }
+    for (std::size_t index = 0; index < image.Imports.size(); ++index) {
+        ir.Label("i" + std::to_string(index));
+        const auto status = ir.Temp();
+        ir.Line(status + " = call i32 @anyps5_import_" + std::to_string(image.Imports[index].Kind) + "()");
+        const auto bad = ir.Icmp("ne", status, "0", "i32");
+        ir.Line("br i1 " + bad + ", label %fault, label %dispatch");
     }
     ir.Label("halt");
     ir.Line("ret i32 0");

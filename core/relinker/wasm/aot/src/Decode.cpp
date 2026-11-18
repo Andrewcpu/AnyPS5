@@ -324,7 +324,10 @@ WasmInsn DecodePrimary(Reader& reader, int opcode, const Rex& rex) {
         if (modrm.Extension == 0 || modrm.Extension == 1) {
             return Finish(reader, modrm.Extension == 0 ? WasmMnemonic::Inc : WasmMnemonic::Dec, width, Rm(modrm), {});
         }
-        if (modrm.Extension == 2 || modrm.Extension == 4) Fail(reader.Address(), "indirect branch is not lifted");
+        if (modrm.Extension == 2 || modrm.Extension == 4) {
+            if (modrm.Memory && modrm.Rip) return Finish(reader, modrm.Extension == 2 ? WasmMnemonic::CallSlot : WasmMnemonic::JmpSlot, 64, {}, Memory(modrm));
+            Fail(reader.Address(), "indirect branch is not lifted");
+        }
         if (modrm.Extension == 6) return Finish(reader, WasmMnemonic::Push, 64, {}, Rm(modrm));
         Fail(reader.Address(), "unsupported FF opcode");
     }
@@ -335,7 +338,7 @@ WasmInsn DecodePrimary(Reader& reader, int opcode, const Rex& rex) {
 }
 
 bool WasmTerminates(WasmMnemonic op) {
-    return op == WasmMnemonic::Jmp || op == WasmMnemonic::Jcc || op == WasmMnemonic::Call || op == WasmMnemonic::Ret || op == WasmMnemonic::Halt;
+    return op == WasmMnemonic::Jmp || op == WasmMnemonic::Jcc || op == WasmMnemonic::Call || op == WasmMnemonic::CallSlot || op == WasmMnemonic::JmpSlot || op == WasmMnemonic::Ret || op == WasmMnemonic::Halt;
 }
 
 WasmInsn DecodeWasmInsn(const std::uint8_t* data, std::size_t available, std::uint64_t address) {
