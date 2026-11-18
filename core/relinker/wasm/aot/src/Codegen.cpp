@@ -188,7 +188,7 @@ std::vector<std::uint8_t> LinkWasmModule(const std::string& ir) {
     const auto linker = FindTool({"wasm-ld", "wasm-ld-18"});
     Require(Run({clang, "--target=wasm32", "-O0", "-c", "-o", object.string(), source.string()}, log), "clang", log);
     Require(Run({linker, "--no-entry", "--export=anyps5_run", "--export=anyps5_state", "--export=anyps5_guest_base",
-        "--export=anyps5_guest_limit", "--export=anyps5_memory_base", "--export-memory", "--initial-memory=" + std::to_string(kMemoryBytes),
+        "--export=anyps5_guest_limit", "--export=anyps5_memory_base", "--export-memory", "--initial-memory=" + std::to_string(kInitialMemory),
         "--global-base=" + std::to_string(kGlobalBase), "-o", binary.string(), object.string()}, log), "wasm-ld", log);
     std::ifstream input(binary, std::ios::binary);
     if (!input) Fail("wasm: cannot read the WebAssembly module");

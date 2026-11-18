@@ -16,6 +16,10 @@ std::string Gpr(int reg) {
     return State(static_cast<std::uint64_t>(reg) * 8);
 }
 
+std::string Scratch(std::uint64_t offset) {
+    return "inttoptr (i32 " + std::to_string(kScratchAddress + offset) + " to ptr)";
+}
+
 std::string Helpers(std::uint64_t guestBase, std::uint64_t guestLimit) {
     const auto base = Number(guestBase);
     const auto limit = Number(guestLimit);
@@ -24,7 +28,11 @@ std::string Helpers(std::uint64_t guestBase, std::uint64_t guestLimit) {
     text += "entry:\n  %zero = icmp eq i64 %size, 0\n  br i1 %zero, label %ok, label %check\n";
     text += "check:\n  %end = add i64 %addr, %size\n  %wrap = icmp ult i64 %end, %addr\n";
     text += "  %below = icmp ult i64 %addr, " + base + "\n  %above = icmp ugt i64 %end, " + limit + "\n";
-    text += "  %low = or i1 %wrap, %below\n  %bad = or i1 %low, %above\n  br i1 %bad, label %fail, label %ok\n";
+    text += "  %low = or i1 %wrap, %below\n  %image = or i1 %low, %above\n";
+    text += "  %direct = load i64, ptr " + Scratch(kHostDirectEnd) + ", align 1\n";
+    text += "  %heap = icmp ult i64 %addr, " + Number(guestBase + kMemoryBytes) + "\n";
+    text += "  %past = icmp ugt i64 %end, %direct\n  %dlow = or i1 %wrap, %heap\n  %outside = or i1 %dlow, %past\n";
+    text += "  %bad = and i1 %image, %outside\n  br i1 %bad, label %fail, label %ok\n";
     text += "ok:\n  ret i32 0\nfail:\n  ret i32 1\n}\n";
     text += "define internal i32 @anyps5_guest_return() {\nentry:\n";
     text += "  %rsp = load i64, ptr " + Gpr(kRsp) + ", align 1\n";
@@ -159,7 +167,61 @@ std::string EmitWasmImports(const WasmImage& image) {
         text += StoreRax("%count");
         text += ReturnTail();
     }
+    if (WasmUsesHost(image)) {
+        text += WasmHostDeclare(WasmHostGroup(image));
+        for (int kind = static_cast<int>(WasmImportKind::Error); kind <= static_cast<int>(WasmImportKind::VideoSubmit); ++kind) {
+            if (!WasmImportsUse(image, static_cast<WasmImportKind>(kind))) continue;
+            text += "define internal i32 @anyps5_import_" + std::to_string(kind) + "() {\nentry:\n";
+            if (kind == static_cast<int>(WasmImportKind::Fmodf)) {
+                text += "  %xmm0 = load i64, ptr " + State(kXmmOffset) + ", align 1\n";
+                text += "  %xmm1 = load i64, ptr " + State(kXmmOffset + 16) + ", align 1\n";
+            }
+            text += LoadGpr(7, "rdi");
+            text += LoadGpr(6, "rsi");
+            text += LoadGpr(2, "rdx");
+            text += LoadGpr(1, "rcx");
+            text += LoadGpr(8, "r8");
+            text += LoadGpr(9, "r9");
+            text += LoadGpr(4, "rsp");
+            text += LoadGpr(0, "rax");
+            text += "  %status = call i32 @anyps5_host_call(i32 " + std::to_string(kind);
+            if (kind == static_cast<int>(WasmImportKind::Fmodf)) {
+                text += ", i64 %xmm0, i64 %xmm1, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0)\n";
+                text += "  %bad = icmp ne i32 %status, 0\n  br i1 %bad, label %fail, label %store\nstore:\n";
+                text += "  %result = load i64, ptr " + Scratch(kHostResult) + ", align 1\n";
+                text += "  store i64 %result, ptr " + State(kXmmOffset) + ", align 1\n";
+                text += "  store i64 0, ptr " + State(kXmmOffset + 8) + ", align 1\n";
+                text += "  %returned = call i32 @anyps5_guest_return()\n  ret i32 %returned\nfail:\n  ret i32 1\n}\n";
+                continue;
+            }
+            text += ", i64 %rdi, i64 %rsi, i64 %rdx, i64 %rcx, i64 %r8, i64 %r9, i64 %rsp, i64 %rax)\n";
+            text += "  %bad = icmp ne i32 %status, 0\n  br i1 %bad, label %fail, label %store\nstore:\n";
+            text += "  %result = load i64, ptr " + Scratch(kHostResult) + ", align 1\n";
+            text += StoreRax("%result");
+            text += ReturnTail();
+        }
+    }
     return text;
+}
+
+bool WasmUsesHost(const WasmImage& image) {
+    for (int kind = static_cast<int>(WasmImportKind::Error); kind <= static_cast<int>(WasmImportKind::VideoSubmit); ++kind) {
+        if (WasmImportsUse(image, static_cast<WasmImportKind>(kind))) return true;
+    }
+    return false;
+}
+
+int WasmHostGroup(const WasmImage& image) {
+    int group = 0;
+    if (WasmImportsUse(image, WasmImportKind::ProcessTime)) ++group;
+    if (WasmImportsUse(image, WasmImportKind::Graphics)) ++group;
+    if (WasmImportsUse(image, WasmImportKind::Puts)) ++group;
+    return group;
+}
+
+std::string WasmHostDeclare(int group) {
+    const auto index = std::to_string(group);
+    return "declare i32 @anyps5_host_call(i32, i64, i64, i64, i64, i64, i64, i64, i64) #" + index + "\nattributes #" + index + " = { \"wasm-import-module\"=\"env\" \"wasm-import-name\"=\"anyps5_host_call\" }\n";
 }
 
 }

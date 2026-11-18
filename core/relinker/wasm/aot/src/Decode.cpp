@@ -245,7 +245,12 @@ WasmInsn DecodeSse(Reader& reader, const Rex& rex) {
 WasmInsn DecodeTwoByte(Reader& reader, const Rex& rex, bool operand16) {
     if (operand16) return DecodeSse(reader, rex);
     const auto opcode = reader.Take();
-    if (opcode == 0x0b || opcode == 0x05) return Finish(reader, WasmMnemonic::Halt, 64, {}, {});
+    if (opcode == 0x0b) return Finish(reader, WasmMnemonic::Halt, 64, {}, {});
+    if (opcode == 0x05) return Finish(reader, WasmMnemonic::Syscall, 64, {}, {});
+    if (opcode == 0x1f) {
+        ReadModrm(reader, rex);
+        return Finish(reader, WasmMnemonic::Nop, 64, {}, {});
+    }
     if (opcode >= 0x80 && opcode <= 0x8f) {
         const auto target = Relative(reader, Sign32(reader.Take32()));
         return Finish(reader, WasmMnemonic::Jcc, 64, {}, {}, static_cast<std::uint8_t>(opcode & 0xf), target);
@@ -259,6 +264,11 @@ WasmInsn DecodeTwoByte(Reader& reader, const Rex& rex, bool operand16) {
         const auto modrm = ReadModrm(reader, rex);
         return Finish(reader, WasmMnemonic::Imul, rex.W ? 64 : 32, Register(modrm.Reg), Rm(modrm));
     }
+    if (opcode == 0xb6 || opcode == 0xbe) {
+        const auto modrm = ReadModrm(reader, rex);
+        if (!modrm.Memory && !rex.Present && modrm.Base >= 4) Fail(reader.Address(), "8-bit high register is not lifted");
+        return Finish(reader, opcode == 0xb6 ? WasmMnemonic::Movzx : WasmMnemonic::Movsx, rex.W ? 64 : 32, Register(modrm.Reg), Rm(modrm), 0, 0, 8);
+    }
     Fail(reader.Address(), "unsupported two-byte opcode");
     return {};
 }
@@ -267,6 +277,7 @@ WasmInsn DecodePrimary(Reader& reader, int opcode, const Rex& rex) {
     const std::uint8_t width = rex.W ? 64 : 32;
     if (opcode == 0x90 && !rex.Present) return Finish(reader, WasmMnemonic::Nop, 64, {}, {});
     if (opcode == 0x98) return Finish(reader, WasmMnemonic::Cdqe, rex.W ? 64 : 32, Register(0), {});
+    if (opcode == 0x99) return Finish(reader, WasmMnemonic::Cqo, rex.W ? 64 : 32, Register(2), Register(0));
     if (opcode == 0xC3 && !rex.Present) return Finish(reader, WasmMnemonic::Ret, 64, {}, {});
     if (opcode == 0xF4 || opcode == 0xCC) return Finish(reader, WasmMnemonic::Halt, 64, {}, {});
     if (opcode >= 0x50 && opcode <= 0x57) return Finish(reader, WasmMnemonic::Push, 64, {}, Register(Extend(opcode & 7, rex.B)));
@@ -363,15 +374,17 @@ WasmInsn DecodePrimary(Reader& reader, int opcode, const Rex& rex) {
         const auto immediate = rex.W ? static_cast<std::uint64_t>(Sign32(raw)) : raw;
         return Finish(reader, WasmMnemonic::MovImm, width, Rm(modrm), Immediate(immediate));
     }
-    if (opcode == 0x85) {
+    if (opcode == 0x84 || opcode == 0x85) {
         const auto modrm = ReadModrm(reader, rex);
-        return Finish(reader, WasmMnemonic::Test, width, Rm(modrm), Register(modrm.Reg));
+        if (opcode == 0x84 && !rex.Present && (modrm.Reg >= 4 || (!modrm.Memory && modrm.Base >= 4))) Fail(reader.Address(), "8-bit high register is not lifted");
+        return Finish(reader, WasmMnemonic::Test, opcode == 0x84 ? 8 : width, Rm(modrm), Register(modrm.Reg));
     }
     if (opcode == 0xf6) Fail(reader.Address(), "8-bit arithmetic is not lifted");
     if (opcode == 0xf7) {
         const auto modrm = ReadModrm(reader, rex);
         if (modrm.Extension == 6) return Finish(reader, WasmMnemonic::Div, width, Rm(modrm), {});
-        if (modrm.Extension == 4 || modrm.Extension == 5 || modrm.Extension == 7) Fail(reader.Address(), "MUL and IDIV are not lifted");
+        if (modrm.Extension == 7) return Finish(reader, WasmMnemonic::Idiv, width, Rm(modrm), {});
+        if (modrm.Extension == 4 || modrm.Extension == 5) Fail(reader.Address(), "MUL is not lifted");
         if (modrm.Extension != 0) Fail(reader.Address(), "unsupported unary opcode");
         const auto raw = reader.Take32();
         const auto immediate = rex.W ? static_cast<std::uint64_t>(Sign32(raw)) : raw;
@@ -394,6 +407,76 @@ WasmInsn DecodePrimary(Reader& reader, int opcode, const Rex& rex) {
     return {};
 }
 
+WasmInsn DecodeVex(Reader& reader, int marker) {
+    int r = 0;
+    int x = 0;
+    int b = 0;
+    int map = 1;
+    int w = 0;
+    int reg = 0;
+    int length = 0;
+    int pp = 0;
+    if (marker == 0xc5) {
+        const auto packed = reader.Take();
+        r = (packed & 0x80) == 0 ? 1 : 0;
+        reg = (~(packed >> 3)) & 0xf;
+        length = (packed >> 2) & 1;
+        pp = packed & 3;
+    } else {
+        const auto first = reader.Take();
+        const auto second = reader.Take();
+        r = (first & 0x80) == 0 ? 1 : 0;
+        x = (first & 0x40) == 0 ? 1 : 0;
+        b = (first & 0x20) == 0 ? 1 : 0;
+        map = first & 0x1f;
+        w = (second & 0x80) == 0 ? 0 : 1;
+        reg = (~(second >> 3)) & 0xf;
+        length = (second >> 2) & 1;
+        pp = second & 3;
+    }
+    if (length != 0) Fail(reader.Address(), "256-bit VEX is not lifted");
+    if (map != 1) Fail(reader.Address(), "unsupported VEX opcode map");
+    Rex rex;
+    rex.Present = true;
+    rex.W = w != 0;
+    rex.R = r != 0;
+    rex.X = x != 0;
+    rex.B = b != 0;
+    const auto opcode = reader.Take();
+    const auto modrm = ReadModrm(reader, rex);
+    if (pp == 2 && (opcode == 0x10 || opcode == 0x11)) {
+        const auto vector = Xmm(modrm.Reg);
+        const auto rm = modrm.Memory ? Memory(modrm) : Xmm(modrm.Base);
+        if (opcode == 0x10) return Finish(reader, WasmMnemonic::Float, 32, vector, rm, static_cast<std::uint8_t>(reg), 0, kFloatMovss);
+        return Finish(reader, WasmMnemonic::Float, 32, rm, vector, static_cast<std::uint8_t>(reg), 0, kFloatMovss);
+    }
+    if (pp == 0 && (opcode == 0x28 || opcode == 0x29)) {
+        const auto vector = Xmm(modrm.Reg);
+        const auto rm = modrm.Memory ? Memory(modrm) : Xmm(modrm.Base);
+        if (opcode == 0x28) return Finish(reader, WasmMnemonic::Float, 128, vector, rm, 0, 0, kFloatMovaps);
+        return Finish(reader, WasmMnemonic::Float, 128, rm, vector, 0, 0, kFloatMovaps);
+    }
+    if (pp == 2 && (opcode == 0x58 || opcode == 0x59 || opcode == 0x5c || opcode == 0x5e)) {
+        const auto operation = opcode == 0x58 ? kFloatAdd : opcode == 0x59 ? kFloatMul : opcode == 0x5c ? kFloatSub : kFloatDiv;
+        const auto rm = modrm.Memory ? Memory(modrm) : Xmm(modrm.Base);
+        return Finish(reader, WasmMnemonic::Float, 32, Xmm(modrm.Reg), rm, static_cast<std::uint8_t>(reg), 0, operation);
+    }
+    if (pp == 2 && opcode == 0x2a) {
+        const auto rm = modrm.Memory ? Memory(modrm) : Register(modrm.Base);
+        return Finish(reader, WasmMnemonic::Float, rex.W ? 64 : 32, Xmm(modrm.Reg), rm, static_cast<std::uint8_t>(reg), 0, kFloatFromInt);
+    }
+    if (pp == 2 && opcode == 0x2c) {
+        const auto rm = modrm.Memory ? Memory(modrm) : Xmm(modrm.Base);
+        return Finish(reader, WasmMnemonic::Float, rex.W ? 64 : 32, Register(modrm.Reg), rm, 0, 0, kFloatToInt);
+    }
+    if (pp == 0 && opcode == 0x2e) {
+        const auto rm = modrm.Memory ? Memory(modrm) : Xmm(modrm.Base);
+        return Finish(reader, WasmMnemonic::Float, 32, Xmm(modrm.Reg), rm, 0, 0, kFloatCmp);
+    }
+    Fail(reader.Address(), "unsupported VEX opcode");
+    return {};
+}
+
 }
 
 bool WasmTerminates(WasmMnemonic op) {
@@ -403,6 +486,7 @@ bool WasmTerminates(WasmMnemonic op) {
 WasmInsn DecodeWasmInsn(const std::uint8_t* data, std::size_t available, std::uint64_t address) {
     Reader reader(data, available, address);
     bool operand16 = false;
+    bool addressSized = false;
     Rex rex;
     while (reader.Peek(), true) {
         const auto byte = reader.Peek();
@@ -411,7 +495,12 @@ WasmInsn DecodeWasmInsn(const std::uint8_t* data, std::size_t available, std::ui
             operand16 = true;
             continue;
         }
-        if (byte == 0x67 || byte == 0xf0 || byte == 0xf2 || byte == 0xf3 || byte == 0x26 || byte == 0x2e || byte == 0x36 || byte == 0x3e || byte == 0x64 || byte == 0x65)
+        if (byte == 0x67) {
+            reader.Take();
+            addressSized = true;
+            continue;
+        }
+        if (byte == 0xf0 || byte == 0xf2 || byte == 0xf3 || byte == 0x26 || byte == 0x2e || byte == 0x36 || byte == 0x3e || byte == 0x64 || byte == 0x65)
             Fail(address, "unsupported prefix");
         if (byte >= 0x40 && byte <= 0x4f) {
             reader.Take();
@@ -430,7 +519,12 @@ WasmInsn DecodeWasmInsn(const std::uint8_t* data, std::size_t available, std::ui
         return insn;
     }
     if (operand16) Fail(address, "16-bit operand size is not lifted");
-    if (opcode == 0xc4 || opcode == 0xc5 || opcode == 0x62) Fail(address, "VEX and EVEX opcodes are not lifted");
+    if (opcode == 0x62) Fail(address, "EVEX opcodes are not lifted");
+    if (opcode == 0xc4 || opcode == 0xc5) {
+        if (addressSized) Fail(address, "address-size prefix is not lifted");
+        return DecodeVex(reader, opcode);
+    }
+    if (addressSized && opcode != 0xe8 && opcode != 0xe9) Fail(address, "address-size prefix is not lifted");
     return DecodePrimary(reader, opcode, rex);
 }
 

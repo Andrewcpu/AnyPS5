@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { kClearOpcode, kCommandBytes, kConstantColor, kDrawOpcode, kMaxExtent, parseCommand, translateShader } from './webgpu.mjs';
+import { kClearOpcode, kCommandBytes, kConstantColor, kDrawOpcode, kMaxExtent, kPresentMax, kPresentOpcode, parseCommand, translateShader } from './webgpu.mjs';
 
 const hostPath = fileURLToPath(new URL('./webgpu.mjs', import.meta.url));
 
@@ -52,6 +52,10 @@ function check() {
     expectThrow('webgpu extent', () => parseCommand(command(kClearOpcode, 0, 2, 0xff0000ff, 0)));
     expectThrow('webgpu extent', () => parseCommand(command(kDrawOpcode, 1, kMaxExtent + 1, 0xffff0000, kConstantColor)));
     expectThrow('webgpu command size', () => parseCommand(command(kClearOpcode, 2, 2, 0xff0000ff, 0).slice(0, 19)));
+    const present = parseCommand(command(kPresentOpcode, kPresentMax, 2, 128, 0));
+    if (present.opcode !== kPresentOpcode || present.width !== kPresentMax || present.offset !== 128 || present.stride !== kPresentMax * 4) fail('present command');
+    expectThrow('webgpu extent', () => parseCommand(command(kPresentOpcode, kPresentMax + 1, 1, 0, 0)));
+    expectThrow('webgpu stride', () => parseCommand(command(kPresentOpcode, 2, 2, 0, 4)));
     console.log('ok');
 }
 

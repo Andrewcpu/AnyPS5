@@ -16,9 +16,19 @@ inline constexpr std::uint64_t kXmmOffset = kRflagsOffset + 8;
 inline constexpr std::uint64_t kStateBytes = kXmmOffset + 16 * 16;
 inline constexpr std::uint64_t kGlobalBase = 0x100000;
 inline constexpr std::uint64_t kMemoryBytes = 0x200000;
+inline constexpr std::uint64_t kScratchBytes = 0x10000;
+inline constexpr std::uint64_t kInitialMemory = kMemoryBytes + kScratchBytes;
+inline constexpr std::uint64_t kScratchAddress = kMemoryBytes;
+inline constexpr std::uint64_t kHostFault = 0;
+inline constexpr std::uint64_t kHostResult = 8;
+inline constexpr std::uint64_t kHostDirectEnd = 16;
+inline constexpr std::uint64_t kHostErrno = 24;
+inline constexpr std::uint64_t kHostStrerror = 32;
+inline constexpr std::uint64_t kHostQueue = 160;
+inline constexpr std::uint64_t kDirectBudget = 0x40000000;
 inline constexpr std::uint64_t kStackBytes = 0x10000;
 inline constexpr std::uint64_t kInitialFlags = 0x202;
-inline constexpr std::uint32_t kStepLimit = 1000000;
+inline constexpr std::uint32_t kStepLimit = 8000000;
 inline constexpr int kRsp = 4;
 
 struct WasmSegment {
@@ -38,7 +48,26 @@ enum class WasmImportKind : std::uint16_t {
     ProcessTime = 4,
     Graphics = 5,
     Puts = 6,
+    Error = 7,
+    Strerror = 8,
+    Snprintf = 9,
+    Vsnprintf = 10,
+    Fmodf = 11,
+    Splash = 12,
+    DirectAlloc = 13,
+    DirectMap = 14,
+    EqueueCreate = 15,
+    EqueueWait = 16,
+    VideoOpen = 17,
+    VideoStatus = 18,
+    VideoFlipEvent = 19,
+    VideoFlipRate = 20,
+    VideoAttribute = 21,
+    VideoRegister = 22,
+    VideoSubmit = 23,
 };
+
+inline constexpr std::uint32_t kHostSyscall = 24;
 
 struct WasmImport {
     std::uint64_t Entry = 0;

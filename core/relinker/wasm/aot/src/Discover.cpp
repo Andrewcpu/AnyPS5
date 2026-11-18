@@ -78,7 +78,7 @@ std::vector<WasmBlock> DiscoverWasmBlocks(const WasmImage& image) {
     bool grew = true;
     while (grew) {
         grew = false;
-        if (starts.size() > 4096) Fail("too many basic blocks");
+        if (starts.size() > 65536) Fail("too many basic blocks");
         blocks.clear();
         std::set<std::uint64_t> extra;
         for (const auto start : starts) {
@@ -126,6 +126,7 @@ std::vector<WasmBlock> DiscoverWasmBlocks(const WasmImage& image) {
                     }
                     break;
                 }
+                if (insn.Op == WasmMnemonic::Lea && insn.Src.Rip && Executable(image, insn.Next + static_cast<std::uint64_t>(insn.Src.Disp))) AddTarget(image, extra, insn.Next + static_cast<std::uint64_t>(insn.Src.Disp));
                 block.Insns.push_back(insn);
                 if (block.Insns.size() > 4096) Fail("basic block is too long");
                 address = insn.Next;
