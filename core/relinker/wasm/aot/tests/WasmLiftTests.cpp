@@ -260,7 +260,8 @@ void CheckState(const std::string& side, const std::uint64_t gpr[16], std::uint6
 const char* kNodeScript = R"(
 const fs = require('fs');
 const bytes = fs.readFileSync(process.argv[2]);
-const imports = { env: { anyps5_host_monotonic_us() { return process.hrtime.bigint() / 1000n; } } };
+let hostText = '';
+const imports = { env: { anyps5_host_monotonic_us() { return process.hrtime.bigint() / 1000n; }, anyps5_host_putc(byte) { hostText += String.fromCharCode(byte & 255); } } };
 const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), imports);
 const status = instance.exports.anyps5_run();
 const state = instance.exports.anyps5_state();
@@ -275,7 +276,7 @@ function hex(start, length) {
   return text;
 }
 function text(value) { return typeof value === 'bigint' ? value.toString() : String(value); }
-process.stdout.write(text(status) + '\n' + text(state) + '\n' + text(base) + '\n' + text(limit) + '\n' + text(memoryBase) + '\n' + hex(state, 400) + '\n' + hex(memoryBase, span) + '\n');
+process.stdout.write(text(status) + '\n' + text(state) + '\n' + text(base) + '\n' + text(limit) + '\n' + text(memoryBase) + '\n' + hex(state, 400) + '\n' + hex(memoryBase, span) + '\n' + hostText.replace(/\n/g, '\\n') + '\n');
 )";
 
 void Unsupported() {
@@ -387,6 +388,7 @@ struct GuestRun {
     std::uint64_t Gpr[16]{};
     std::uint64_t Rip = 0;
     std::uint64_t Flags = 0;
+    std::string HostText;
     std::uint8_t Xmm[16][16]{};
 };
 
@@ -459,6 +461,7 @@ GuestRun RunGuest(const std::vector<std::uint8_t>& elf) {
     for (int index = 0; index < 16; ++index) run.Gpr[index] = Read64(run.State.data() + index * 8);
     run.Rip = Read64(run.State.data() + Relinker::Wasm::kRipOffset);
     run.Flags = Read64(run.State.data() + Relinker::Wasm::kRflagsOffset);
+    std::getline(lines, run.HostText);
     for (int reg = 0; reg < 16; ++reg) std::memcpy(run.Xmm[reg], run.State.data() + Relinker::Wasm::kXmmOffset + static_cast<std::size_t>(reg) * 16, 16);
     return run;
 }
@@ -632,7 +635,7 @@ void RelocationBytes() {
     ExpectEqual("R_X86_64_GLOB_DAT", Read64(segment.Bytes.data() + 16), data + 0x20);
     ExpectEqual("weak undefined", Read64(segment.Bytes.data() + 24), 0);
     ExpectEqual("R_X86_64_64 addend", Read64(segment.Bytes.data() + 32), data + 0x28);
-    std::vector<std::uint8_t> dyn(96);
+    std::vector<std::uint8_t> dyn(104);
     const std::uint64_t slot = data;
     const std::uint64_t rela = data + 8;
     const std::uint64_t dynamic = data + 32;
@@ -679,7 +682,7 @@ void RelocationBytes() {
     };
     phdr(0, 1, 5, codeAt, base, code.size(), code.size());
     phdr(1, 1, 6, dataAt, data, dyn.size(), dyn.size());
-    phdr(2, 2, 6, dataAt + 32, dynamic, 64, 64);
+    phdr(2, 2, 6, dataAt + 32, dynamic, 72, 72);
     std::memcpy(dynamicElf.data() + codeAt, code.data(), code.size());
     std::memcpy(dynamicElf.data() + dataAt, dyn.data(), dyn.size());
     const auto dynamicPlan = Relinker::Wasm::PlanWasmImage(dynamicElf);
@@ -998,6 +1001,7 @@ GuestRun RunWasm(const std::vector<std::uint8_t>& elf) {
     for (int index = 0; index < 16; ++index) run.Gpr[index] = Read64(run.State.data() + index * 8);
     run.Rip = Read64(run.State.data() + Relinker::Wasm::kRipOffset);
     run.Flags = Read64(run.State.data() + Relinker::Wasm::kRflagsOffset);
+    std::getline(lines, run.HostText);
     return run;
 }
 
@@ -1128,14 +1132,26 @@ void Optimized() {
         Require(ir.find("br label %g1005d") != std::string::npos, "milestone call was not direct");
         Require(ir.find("i64 65555, label %g10013") != std::string::npos, "milestone return was not direct");
     }
+    {
+        constexpr std::uint64_t base = 0x250000;
+        Asm code;
+        code.B({0xb8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x0d, 0x0b, 0x00, 0x00, 0x00, 0x51, 0x83, 0xf8, 0x00, 0x74, 0x05, 0xff, 0x14, 0x24, 0x0f, 0x0b, 0x83, 0xc0, 0x05, 0xc3});
+        const auto run = RunGuest(Elf(base, base, code.Bytes));
+        Require(run.Native.Signal == SIGILL, "indirect signal");
+        ExpectEqual("indirect status", run.Status, 0);
+        ExpectEqual("indirect eax", run.Gpr[0], 6);
+        ExpectEqual("native indirect eax", run.Native.Gpr[0], 6);
+        ExpectEqual("indirect rip", run.Rip, base + 21);
+        ExpectSameMemory(run);
+    }
     bool threw = false;
     try {
-        (void)Relinker::Wasm::CompileWasm(Elf(0x10000, 0x10000, {0xff, 0xd0}));
+        (void)Relinker::Wasm::CompileWasm(Elf(0x10000, 0x10000, {0xb4, 0x01, 0x0f, 0x0b}));
     } catch (const std::exception& error) {
         threw = true;
-        Require(std::string(error.what()).find("indirect") != std::string::npos, std::string("unexpected reject: ") + error.what());
+        Require(std::string(error.what()).find("high") != std::string::npos, std::string("unexpected reject: ") + error.what());
     }
-    Require(threw, "indirect call was lifted");
+    Require(threw, "high byte register was lifted");
 }
 
 void Imports() {
@@ -1233,10 +1249,31 @@ void Imports() {
     const auto qualifiedElf = DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {}, {{qualified, dataVA}});
     const auto* qualifiedImport = FindImport(Relinker::Wasm::PlanWasmImage(qualifiedElf), qualified);
     Require(qualifiedImport != nullptr && qualifiedImport->Nid == strlenNid && qualifiedImport->Kind == static_cast<std::uint16_t>(Relinker::Wasm::WasmImportKind::Strlen), "qualified NID import");
-    Throws(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {"libc.so.6"}, {{"memcpy", dataVA}}), "undefined");
+    const auto plain = DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {"libc.so.6"}, {{"memcpy", dataVA}});
+    const auto* plainImport = FindImport(Relinker::Wasm::PlanWasmImage(plain), "memcpy");
+    Require(plainImport != nullptr && plainImport->Kind == static_cast<std::uint16_t>(Relinker::Wasm::WasmImportKind::Memcpy), "plain memcpy import");
+    Throws(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {"libc.so.6"}, {{"malloc", dataVA}}), "undefined");
     Throws(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {"libSceLibcInternal.sprx"}, {{"malloc", dataVA}}), "undefined");
     Throws(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {}, {{"memcpy#only", dataVA}}), "qualified");
     Throws(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {}, {{"memcpy#lib#*", dataVA}}), "module ID");
+    constexpr std::uint64_t text = dataVA + 0x40;
+    Asm putsCode;
+    putsCode.B({0x48, 0xbf});
+    putsCode.U64(text);
+    putsCode.B({0xff, 0x15});
+    const auto next = codeVA + putsCode.Bytes.size() + 4;
+    putsCode.U32(static_cast<std::uint32_t>(static_cast<std::int64_t>(dataVA) - static_cast<std::int64_t>(next)));
+    const auto putsUd2 = codeVA + putsCode.Bytes.size();
+    putsCode.B({0x0f, 0x0b});
+    std::vector<std::uint8_t> putsData(0x50);
+    putsData[0x40] = 'h';
+    putsData[0x41] = 'i';
+    const auto putsElf = DynamicElf(codeVA, putsCode.Bytes, dataVA, putsData, {"libSceLibcInternal.so"}, {{"puts", dataVA, 6}});
+    const auto putsRun = RunWasm(putsElf);
+    ExpectEqual("puts status", putsRun.Status, 0);
+    ExpectEqual("puts rip", putsRun.Rip, putsUd2);
+    ExpectEqual("puts rax", putsRun.Gpr[0], 3);
+    Require(putsRun.HostText == "hi\\n", "puts text is " + putsRun.HostText);
 }
 
 const char* kGraphicsScript = R"(
@@ -1434,6 +1471,95 @@ void WebGpu() {
 
 }
 
+void Forms() {
+    constexpr std::uint64_t base = 0x240000;
+    Asm code;
+    code.B({0x48, 0xb8});
+    code.U64(0x1122334455667788ull);
+    code.B({0xb0, 0xab, 0x48, 0xbb});
+    code.U64(base + 0x180);
+    code.B({0x88, 0x03, 0xc7, 0x43, 0x04});
+    code.U32(0xfffffffe);
+    code.B({0x48, 0x63, 0x4b, 0x04, 0x49, 0x89, 0xc0, 0x49, 0x89, 0xc9, 0xb8});
+    code.U32(0xffffffff);
+    code.B({0x48, 0x98, 0x49, 0x89, 0xc7, 0x41, 0xbb});
+    code.U32(5);
+    code.B({0x4d, 0x6b, 0xdb, 0x03, 0xb8});
+    code.U32(20);
+    code.B({0x31, 0xd2, 0xb9});
+    code.U32(6);
+    code.B({0x48, 0xf7, 0xf1, 0x49, 0x89, 0xc5, 0x49, 0x89, 0xd6, 0x31, 0xc0, 0x83, 0xf8, 0x01, 0x0f, 0x95, 0xc0, 0x49, 0x89, 0xc4, 0xb8});
+    code.U32(0x10);
+    code.B({0x48, 0xc1, 0xe8, 0x01, 0x49, 0x89, 0xc2, 0x48, 0xc7, 0xc0, 0xfe, 0xff, 0xff, 0xff, 0x48, 0xc1, 0xf8, 0x03, 0x48, 0x89, 0xc5, 0xb8});
+    code.U32(0xfffffffe);
+    code.B({0xc1, 0xf8, 0x01, 0x48, 0x89, 0xc7, 0xb8});
+    code.U32(9);
+    code.B({0xb1, 0x01, 0xd3, 0xe0, 0x48, 0x89, 0xc6, 0xb8});
+    code.U32(0x80000000u);
+    code.B({0xc1, 0xe0, 0x01, 0x0f, 0x0b});
+    code.Bytes.resize(0x200);
+    const auto run = RunGuest(Elf(base, base, code.Bytes));
+    Require(run.Native.Signal == SIGILL, "forms signal");
+    ExpectEqual("forms status", run.Status, 0);
+    ExpectEqual("forms rax", run.Gpr[0], 0);
+    ExpectEqual("forms rcx", run.Gpr[1], 1);
+    ExpectEqual("forms rdx", run.Gpr[2], 2);
+    ExpectEqual("forms rbx", run.Gpr[3], base + 0x180);
+    ExpectEqual("forms rsi", run.Gpr[6], 18);
+    ExpectEqual("forms rdi", run.Gpr[7], 0xffffffffull);
+    ExpectEqual("forms r8", run.Gpr[8], 0x11223344556677abull);
+    ExpectEqual("forms r9", run.Gpr[9], ~std::uint64_t{1});
+    ExpectEqual("forms r10", run.Gpr[10], 8);
+    ExpectEqual("forms r11", run.Gpr[11], 15);
+    ExpectEqual("forms r12", run.Gpr[12], 1);
+    ExpectEqual("forms r13", run.Gpr[13], 3);
+    ExpectEqual("forms r14", run.Gpr[14], 2);
+    ExpectEqual("forms r15", run.Gpr[15], ~std::uint64_t{0});
+    ExpectEqual("forms rbp", run.Gpr[5], ~std::uint64_t{0});
+    for (int index = 0; index < 16; ++index) ExpectEqual("forms native gpr " + std::to_string(index), run.Gpr[index], run.Native.Gpr[index]);
+    ExpectFlags("forms flags", run.Native.Flags, run.Flags, false);
+    ExpectSameMemory(run);
+    {
+        Asm zero;
+        zero.B({0xb8, 0x01, 0x00, 0x00, 0x00, 0x83, 0xf8, 0x01, 0xc1, 0xe0, 0x00, 0x0f, 0x0b});
+        const auto kept = RunGuest(Elf(0x241000, 0x241000, zero.Bytes));
+        ExpectEqual("shift zero eax", kept.Gpr[0], 1);
+        ExpectEqual("shift zero native eax", kept.Native.Gpr[0], 1);
+        ExpectFlags("shift zero flags", kept.Native.Flags, kept.Flags, false);
+    }
+    {
+        Asm product;
+        product.B({0xb8, 0x05, 0x00, 0x00, 0x00, 0x6b, 0xc0, 0x03, 0x0f, 0x0b});
+        const auto imul = RunGuest(Elf(0x242000, 0x242000, product.Bytes));
+        ExpectEqual("imul eax", imul.Gpr[0], 15);
+        ExpectEqual("imul native eax", imul.Native.Gpr[0], 15);
+        ExpectFlags("imul flags", imul.Native.Flags, imul.Flags, false);
+    }
+    {
+        Asm byte;
+        byte.B({0x48, 0xb8});
+        byte.U64(0x1122334455667788ull);
+        byte.B({0xb0, 0x81, 0xa8, 0x01, 0x0f, 0x0b});
+        const auto tested = RunGuest(Elf(0x243000, 0x243000, byte.Bytes));
+        ExpectEqual("test al rax", tested.Gpr[0], 0x1122334455667781ull);
+        ExpectEqual("test al native rax", tested.Native.Gpr[0], 0x1122334455667781ull);
+        ExpectFlags("test al flags", tested.Native.Flags, tested.Flags, false);
+    }
+    {
+        constexpr std::uint64_t root = 0x260000;
+        std::vector<std::uint8_t> bytes(32, 0x90);
+        bytes[0] = 0x0f;
+        bytes[1] = 0x0b;
+        bytes[16] = 0xb8;
+        bytes[17] = 0x01;
+        bytes[21] = 0x0f;
+        bytes[22] = 0x0b;
+        const auto elf = MakeElf(root, 2, {{root, 5, bytes.size(), bytes}, {root + 0x1000, 6, 8, std::vector<std::uint8_t>(8)}}, {}, {{root + 0x1000, 8, 0, static_cast<std::int64_t>(root + 16)}}, false);
+        const auto ir = ModuleText(elf);
+        Require(ir.find("g260010:") != std::string::npos, "relocated executable pointer was not a block");
+    }
+}
+
 int main() {
     try {
         ArmSignals();
@@ -1447,6 +1573,7 @@ int main() {
         Optimized();
         Imports();
         WebGpu();
+        Forms();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
