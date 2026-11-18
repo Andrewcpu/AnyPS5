@@ -49,7 +49,7 @@ relinker [options] <input.elf> <output>
 relinker --wasm <input.elf> <output.wasm>
 ```
 
-`relinker --wasm` lifts a freestanding x86-64 ELF to a WebAssembly module. It cannot be combined with the native conversion options, and it does not load PS5 modules. The host needs `clang` and `wasm-ld` as described in [the relinker build](../dev/BUILD.md).
+`relinker --wasm` lifts a freestanding x86-64 ELF to a WebAssembly module. It cannot be combined with the native conversion options, and it does not load PS5 modules. Guest pointers are translated into the module's linear memory and are not WebAssembly addresses. The host needs `clang` and `wasm-ld` as described in [the relinker build](../dev/BUILD.md).
 
 ### Dry run
 

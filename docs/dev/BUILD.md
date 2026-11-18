@@ -16,7 +16,7 @@ This mode builds the conversion tool and its tests on Linux, Windows and macOS, 
 
 The output is x86-64: Linux ELF by default, Windows PE with `--windows` or Mach-O with `--macos` ([usage](../user/USAGE.md#input-and-conversion)). Converted games need system libraries built for the target OS and a compatible x86-64 host. This mode does not build those libraries, and releases ship them for Linux and Windows only. Tests inspect all three output formats; execution checks run only on their compatible hosts.
 
-`relinker --wasm <input.elf> <output.wasm>` lifts a freestanding x86-64 ELF to a WebAssembly module. The command needs `clang` or `clang-18`, with a WebAssembly target, and `wasm-ld` or `wasm-ld-18` on `PATH`. The comparison test `wasm_lift` also needs `node`. CMake registers it only on Linux x86-64, and only after those tools compile a probe module. The test runs the guest natively until `UD2` and the module in Node's WebAssembly runtime, then compares registers and guest memory.
+`relinker --wasm <input.elf> <output.wasm>` lifts a freestanding x86-64 ELF to a WebAssembly module. The command needs `clang` or `clang-18`, with a WebAssembly target, and `wasm-ld` or `wasm-ld-18` on `PATH`. The comparison test `wasm_lift` also needs `node`. CMake registers it only on Linux x86-64, and only after those tools compile a probe module. The test runs the guest natively until `UD2` or a fault and the module in Node's WebAssembly runtime, then compares registers, flags and guest memory.
 
 Use a separate build directory for the full build.
 
