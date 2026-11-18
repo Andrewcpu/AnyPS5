@@ -87,6 +87,7 @@ constexpr Wrapper kWrappers[] = {
     {"memset", WasmImportKind::Memset},
     {"strlen", WasmImportKind::Strlen},
     {"sceKernelGetProcessTime", WasmImportKind::ProcessTime},
+    {"anyps5_webgpu_submit", WasmImportKind::Graphics},
 };
 
 std::uint16_t Lookup(const std::string& key, bool qualified, bool hashPlain) {
