@@ -7,6 +7,7 @@
 namespace Relinker::Wasm {
 
 [[nodiscard]] std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>& blocks);
+[[nodiscard]] std::string EmitWasmImports(const WasmImage& image);
 
 }
 #endif

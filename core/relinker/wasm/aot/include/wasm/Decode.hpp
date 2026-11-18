@@ -26,6 +26,8 @@ enum class WasmMnemonic : std::uint8_t {
     Jmp,
     Jcc,
     Call,
+    CallSlot,
+    JmpSlot,
     Ret,
     Halt,
     MovdToXmm,

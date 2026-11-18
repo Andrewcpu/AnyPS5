@@ -2,6 +2,7 @@
 #define WASM_AOT_WASMTARGET_HPP
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace Relinker::Wasm {
@@ -30,16 +31,41 @@ struct WasmSegment {
     std::vector<std::uint8_t> Bytes;
 };
 
+enum class WasmImportKind : std::uint16_t {
+    Memcpy = 1,
+    Memset = 2,
+    Strlen = 3,
+    ProcessTime = 4,
+};
+
+struct WasmImport {
+    std::uint64_t Entry = 0;
+    std::uint64_t Symbol = 0;
+    std::uint16_t Kind = 0;
+    std::string Name;
+    std::string Nid;
+};
+
 struct WasmImage {
     std::uint64_t Entry = 0;
     std::uint64_t GuestBase = 0;
     std::uint64_t StackBase = 0;
     std::uint64_t StackTop = 0;
     std::uint64_t GuestLimit = 0;
+    bool HashPlainImports = false;
     std::vector<WasmSegment> Segments;
+    std::vector<WasmImport> Imports;
 };
 
+[[nodiscard]] inline bool WasmImportsUse(const WasmImage& image, WasmImportKind kind) {
+    const auto value = static_cast<std::uint16_t>(kind);
+    for (const auto& import : image.Imports) if (import.Kind == value) return true;
+    return false;
+}
+
 [[nodiscard]] WasmImage PlanWasmImage(const std::vector<std::uint8_t>& elf);
+void PrepareWasmImports(const std::vector<std::uint8_t>& elf, WasmImage& image);
+void BindWasmSymbol(const std::vector<std::uint8_t>& elf, WasmImage& image, std::uint64_t symbolIndex, std::uint16_t section, std::uint8_t info, std::uint32_t name, std::uint64_t stringOffset, std::uint64_t stringSize);
 void ApplyWasmRelocations(const std::vector<std::uint8_t>& elf, WasmImage& image);
 [[nodiscard]] std::vector<std::uint8_t> CompileWasm(const std::vector<std::uint8_t>& elf);
 

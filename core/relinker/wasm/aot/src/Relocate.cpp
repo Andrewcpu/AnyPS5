@@ -46,6 +46,7 @@ bool IsTls(std::uint32_t type) {
 
 struct Symbol {
     std::uint64_t Value = 0;
+    std::uint32_t Name = 0;
     std::uint16_t Index = 0;
     std::uint8_t Info = 0;
 };
@@ -76,16 +77,20 @@ Symbol ReadSymbol(const std::vector<std::uint8_t>& elf, std::uint64_t offset, st
     const auto at = offset + index * entsize;
     if (!Fits(at, 24, elf.size())) Fail("wasm: symbol table is outside the file");
     Symbol symbol;
+    symbol.Name = Read32(elf, static_cast<std::size_t>(at));
     symbol.Info = elf[static_cast<std::size_t>(at + 4)];
     symbol.Index = Read16(elf, static_cast<std::size_t>(at + 6));
     symbol.Value = Read64(elf, static_cast<std::size_t>(at + 8));
     return symbol;
 }
 
-std::uint64_t SymbolValue(const Symbol& symbol) {
+std::uint64_t SymbolValue(const WasmImage& image, const Symbol& symbol, std::uint64_t index) {
     const unsigned bind = symbol.Info >> 4;
     if (symbol.Index == 0) {
         if (bind == 2) return 0;
+        for (const auto& import : image.Imports) {
+            if (import.Symbol == index) return import.Entry;
+        }
         Fail("wasm: undefined relocation symbol");
     }
     if (symbol.Index == 0xfff2 || (symbol.Index >= 0xff00 && symbol.Index != 0xfff1)) Fail("wasm: unsupported relocation symbol section");
@@ -112,7 +117,7 @@ void Write(WasmImage& image, std::uint64_t address, std::uint64_t value, int siz
     Fail("wasm: relocation is outside a load segment");
 }
 
-void ApplyOne(WasmImage& image, std::uint64_t place, std::uint32_t type, std::int64_t addend, const Symbol* symbol, std::vector<std::pair<std::uint64_t, std::uint64_t>>& used) {
+void ApplyOne(WasmImage& image, std::uint64_t place, std::uint32_t type, std::int64_t addend, const Symbol* symbol, std::uint64_t symbolIndex, std::vector<std::pair<std::uint64_t, std::uint64_t>>& used) {
     if (type == 0) return;
     if (IsTls(type)) Fail("wasm: TLS relocation is not supported");
     if (type == 3 || type == 9 || type == 25 || type == 26 || type == 41 || type == 42) Fail("wasm: unsupported relocation type");
@@ -122,29 +127,30 @@ void ApplyOne(WasmImage& image, std::uint64_t place, std::uint32_t type, std::in
         return;
     }
     if (symbol == nullptr) Fail("wasm: relocation symbol table is missing");
+    const auto resolved = [&] { return SymbolValue(image, *symbol, symbolIndex); };
     if (type == 6 || type == 7) {
         if (addend != 0) Fail("wasm: nonzero GLOB_DAT or JUMP_SLOT addend");
-        Write(image, place, SymbolValue(*symbol), 8, used);
+        Write(image, place, resolved(), 8, used);
         return;
     }
     if (type == 1) {
-        Write(image, place, added(SymbolValue(*symbol)), 8, used);
+        Write(image, place, added(resolved()), 8, used);
         return;
     }
     if (type == 10) {
-        const auto value = added(SymbolValue(*symbol));
+        const auto value = added(resolved());
         if (value > 0xffffffffu) Fail("wasm: relocation overflows");
         Write(image, place, value, 4, used);
         return;
     }
     if (type == 11) {
-        const auto value = added(SymbolValue(*symbol));
+        const auto value = added(resolved());
         if (!FitsI32(value)) Fail("wasm: relocation overflows");
         Write(image, place, value, 4, used);
         return;
     }
     if (type == 2 || type == 4 || type == 24) {
-        const auto value = added(SymbolValue(*symbol)) - place;
+        const auto value = added(resolved()) - place;
         if (type != 24 && !FitsI32(value)) Fail("wasm: relocation overflows");
         Write(image, place, value, type == 24 ? 8 : 4, used);
         return;
@@ -183,7 +189,7 @@ std::vector<Section> Sections(const std::vector<std::uint8_t>& elf) {
     return sections;
 }
 
-void ApplyTable(const std::vector<std::uint8_t>& elf, WasmImage& image, std::uint64_t offset, std::uint64_t size, std::uint64_t symbolOffset, std::uint64_t symbolSize, std::uint64_t symbolEntsize, bool haveSymbols, std::vector<std::pair<std::uint64_t, std::uint64_t>>& used) {
+void ApplyTable(const std::vector<std::uint8_t>& elf, WasmImage& image, std::uint64_t offset, std::uint64_t size, std::uint64_t symbolOffset, std::uint64_t symbolSize, std::uint64_t symbolEntsize, std::uint64_t stringOffset, std::uint64_t stringSize, bool haveSymbols, std::vector<std::pair<std::uint64_t, std::uint64_t>>& used) {
     if (size % 24 != 0) Fail("wasm: relocation table size is not a multiple of the entry");
     for (std::uint64_t cursor = 0; cursor < size; cursor += 24) {
         const auto at = offset + cursor;
@@ -197,9 +203,10 @@ void ApplyTable(const std::vector<std::uint8_t>& elf, WasmImage& image, std::uin
         if (type != 0 && type != 8) {
             if (!haveSymbols) Fail("wasm: relocation symbol table is missing");
             symbol = ReadSymbol(elf, symbolOffset, symbolSize, symbolEntsize, index);
+            if (symbol.Index == 0 && (symbol.Info >> 4) != 2) BindWasmSymbol(elf, image, index, symbol.Index, symbol.Info, symbol.Name, stringOffset, stringSize);
             resolved = &symbol;
         }
-        ApplyOne(image, place, type, addend, resolved, used);
+        ApplyOne(image, place, type, addend, resolved, index, used);
     }
 }
 
@@ -213,7 +220,9 @@ bool ApplySections(const std::vector<std::uint8_t>& elf, WasmImage& image, const
         const auto& symbols = sections[section.Link];
         if (symbols.Type != 2 && symbols.Type != 11) Fail("wasm: relocation symbol table has an unexpected type");
         if (symbols.Entsize != 0 && symbols.Entsize < 24) Fail("wasm: symbol entry is too small");
-        ApplyTable(elf, image, section.Offset, section.Size, symbols.Offset, symbols.Size, symbols.Entsize == 0 ? 24 : symbols.Entsize, true, used);
+        if (symbols.Link >= sections.size()) Fail("wasm: import symbol name lies outside the string table");
+        const auto& strings = sections[symbols.Link];
+        ApplyTable(elf, image, section.Offset, section.Size, symbols.Offset, symbols.Size, symbols.Entsize == 0 ? 24 : symbols.Entsize, strings.Offset, strings.Size, true, used);
         saw = true;
     }
     return saw;
@@ -229,11 +238,15 @@ void ApplyDynamic(const std::vector<std::uint8_t>& elf, WasmImage& image, std::v
     std::uint64_t relaent = 24;
     std::uint64_t symtab = 0;
     std::uint64_t syment = 24;
+    std::uint64_t strtab = 0;
+    std::uint64_t strsz = 0;
     std::uint64_t jmprel = 0;
     std::uint64_t pltrelsz = 0;
     std::int64_t pltrel = 0;
     bool haveRela = false;
     bool haveSymtab = false;
+    bool haveStrtab = false;
+    bool haveStrsz = false;
     bool haveJmp = false;
     for (std::uint16_t index = 0; index < phnum; ++index) {
         const auto header = static_cast<std::size_t>(phoff) + static_cast<std::size_t>(index) * phentsize;
@@ -251,9 +264,15 @@ void ApplyDynamic(const std::vector<std::uint8_t>& elf, WasmImage& image, std::v
                 terminated = true;
                 break;
             }
-            if (tag == 6) {
+            if (tag == 5) {
+                strtab = value;
+                haveStrtab = true;
+            } else if (tag == 6) {
                 symtab = value;
                 haveSymtab = true;
+            } else if (tag == 10) {
+                strsz = value;
+                haveStrsz = true;
             } else if (tag == 7) {
                 rela = value;
                 haveRela = true;
@@ -275,27 +294,37 @@ void ApplyDynamic(const std::vector<std::uint8_t>& elf, WasmImage& image, std::v
     if (haveRela && relasz != 0 && relaent != 24) Fail("wasm: unexpected relocation entry size");
     std::uint64_t symbolOffset = 0;
     std::uint64_t symbolSize = 0;
+    std::uint64_t stringOffset = 0;
+    std::uint64_t stringSize = 0;
     if (haveSymtab) {
         const auto symbols = Locate(image, symtab);
         if (!symbols.Found) Fail("wasm: dynamic symbol table is outside a load segment");
         symbolOffset = symbols.Offset;
         symbolSize = symbols.Available;
     }
+    if (haveStrtab) {
+        if (!haveStrsz || strsz == 0) Fail("wasm: dynamic string table is missing");
+        const auto strings = Locate(image, strtab);
+        if (!strings.Found || strsz > strings.Available) Fail("wasm: dynamic string table is outside a load segment");
+        stringOffset = strings.Offset;
+        stringSize = strsz;
+    }
     if (haveRela && relasz != 0) {
         const auto table = Locate(image, rela);
         if (!table.Found || relasz > table.Available) Fail("wasm: dynamic relocation table is outside a load segment");
-        ApplyTable(elf, image, table.Offset, relasz, symbolOffset, symbolSize, syment, haveSymtab, used);
+        ApplyTable(elf, image, table.Offset, relasz, symbolOffset, symbolSize, syment, stringOffset, stringSize, haveSymtab, used);
     }
     if (!haveJmp || pltrelsz == 0) return;
     if (pltrel != 7) Fail("wasm: REL relocations are not supported");
     const auto jumps = Locate(image, jmprel);
     if (!jumps.Found || pltrelsz > jumps.Available) Fail("wasm: dynamic relocation table is outside a load segment");
-    ApplyTable(elf, image, jumps.Offset, pltrelsz, symbolOffset, symbolSize, syment, haveSymtab, used);
+    ApplyTable(elf, image, jumps.Offset, pltrelsz, symbolOffset, symbolSize, syment, stringOffset, stringSize, haveSymtab, used);
 }
 
 }
 
 void ApplyWasmRelocations(const std::vector<std::uint8_t>& elf, WasmImage& image) {
+    PrepareWasmImports(elf, image);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> used;
     const auto sections = Sections(elf);
     if (ApplySections(elf, image, sections, used)) return;

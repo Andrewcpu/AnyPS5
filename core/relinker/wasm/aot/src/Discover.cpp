@@ -26,7 +26,45 @@ Span ExecutableBytes(const WasmImage& image, std::uint64_t address) {
     return {};
 }
 
-void AddTarget(std::set<std::uint64_t>& extra, std::uint64_t target) { extra.insert(target); }
+bool ImportEntry(const WasmImage& image, std::uint64_t address) {
+    for (const auto& import : image.Imports) if (import.Entry == address) return true;
+    return false;
+}
+
+bool Executable(const WasmImage& image, std::uint64_t address) {
+    for (const auto& segment : image.Segments) {
+        if ((segment.Flags & 1u) == 0 || segment.FileSize == 0) continue;
+        if (address >= segment.Virtual && address < segment.Virtual + segment.FileSize) return true;
+    }
+    return false;
+}
+
+std::uint64_t ReadQword(const WasmImage& image, std::uint64_t address) {
+    for (const auto& segment : image.Segments) {
+        if (segment.MemorySize < 8 || address < segment.Virtual) continue;
+        const auto delta = address - segment.Virtual;
+        if (delta > segment.MemorySize - 8) continue;
+        std::uint64_t value = 0;
+        for (int index = 0; index < 8; ++index) value |= static_cast<std::uint64_t>(segment.Bytes[static_cast<std::size_t>(delta) + static_cast<std::size_t>(index)]) << (8 * index);
+        return value;
+    }
+    Fail("indirect branch target is not an import");
+    return 0;
+}
+
+std::uint64_t ResolveSlot(const WasmImage& image, const WasmInsn& insn) {
+    if (!insn.Src.Rip) Fail("indirect branch is not lifted");
+    const auto slot = insn.Next + static_cast<std::uint64_t>(insn.Src.Disp);
+    const auto value = ReadQword(image, slot);
+    if (ImportEntry(image, value) || Executable(image, value)) return value;
+    Fail("indirect branch target is not an import");
+    return 0;
+}
+
+void AddTarget(const WasmImage& image, std::set<std::uint64_t>& extra, std::uint64_t target) {
+    if (ImportEntry(image, target)) return;
+    extra.insert(target);
+}
 
 }
 
@@ -59,19 +97,19 @@ std::vector<WasmBlock> DiscoverWasmBlocks(const WasmImage& image) {
                 if (WasmTerminates(insn.Op)) {
                     block.Edge = insn.Address;
                     block.Cc = insn.Cc;
-                    block.Target = insn.Target;
+                    block.Target = insn.Op == WasmMnemonic::CallSlot || insn.Op == WasmMnemonic::JmpSlot ? ResolveSlot(image, insn) : insn.Target;
                     block.Fall = insn.Next;
-                    if (insn.Op == WasmMnemonic::Jmp) {
+                    if (insn.Op == WasmMnemonic::Jmp || insn.Op == WasmMnemonic::JmpSlot) {
                         block.EdgeKind = WasmBlock::Kind::Jump;
-                        AddTarget(extra, insn.Target);
+                        AddTarget(image, extra, block.Target);
                     } else if (insn.Op == WasmMnemonic::Jcc) {
                         block.EdgeKind = WasmBlock::Kind::Branch;
-                        AddTarget(extra, insn.Target);
-                        AddTarget(extra, insn.Next);
-                    } else if (insn.Op == WasmMnemonic::Call) {
+                        AddTarget(image, extra, insn.Target);
+                        AddTarget(image, extra, insn.Next);
+                    } else if (insn.Op == WasmMnemonic::Call || insn.Op == WasmMnemonic::CallSlot) {
                         block.EdgeKind = WasmBlock::Kind::Call;
-                        AddTarget(extra, insn.Target);
-                        AddTarget(extra, insn.Next);
+                        AddTarget(image, extra, block.Target);
+                        AddTarget(image, extra, insn.Next);
                     } else if (insn.Op == WasmMnemonic::Ret) {
                         block.EdgeKind = WasmBlock::Kind::Return;
                     } else {

@@ -232,11 +232,14 @@ add_library(relinker_wasm_aot STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Decode.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Discover.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Lift.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Imports.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Wrappers.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Codegen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/WasmTarget.cpp)
 target_include_directories(relinker_wasm_aot PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/domain/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../libs/nid/include)
 target_compile_features(relinker_wasm_aot PUBLIC cxx_std_20)
 set_target_properties(relinker_wasm_aot PROPERTIES CXX_EXTENSIONS OFF)
 
@@ -270,7 +273,7 @@ printf '%s' "$node_bin"
         OUTPUT_VARIABLE ANYPS5_NODE
         ERROR_VARIABLE anyps5WasmProbeError)
     if(anyps5WasmProbeResult EQUAL 0)
-        add_test_executable(wasm_lift_tests ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/tests/WasmLiftTests.cpp)
+        add_test_executable(wasm_lift_tests ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/tests/WasmLiftTests.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../libs/nid/src/NidCompute.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../libs/nid/src/Sha1.cpp)
         target_link_libraries(wasm_lift_tests PRIVATE relinker_wasm_aot)
         target_compile_features(wasm_lift_tests PRIVATE cxx_std_20)
         set_target_properties(wasm_lift_tests PROPERTIES CXX_EXTENSIONS OFF)

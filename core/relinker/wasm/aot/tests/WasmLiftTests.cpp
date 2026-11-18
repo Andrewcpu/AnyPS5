@@ -3,6 +3,7 @@
 #endif
 #include <wasm/WasmTarget.hpp>
 #include <domain/Types.hpp>
+#include <nid/NidCompute.hpp>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -257,7 +258,8 @@ void CheckState(const std::string& side, const std::uint64_t gpr[16], std::uint6
 const char* kNodeScript = R"(
 const fs = require('fs');
 const bytes = fs.readFileSync(process.argv[2]);
-const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes));
+const imports = { env: { anyps5_host_monotonic_us() { return process.hrtime.bigint() / 1000n; } } };
+const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), imports);
 const status = instance.exports.anyps5_run();
 const state = instance.exports.anyps5_state();
 const base = instance.exports.anyps5_guest_base();
@@ -863,6 +865,246 @@ void Fault() {
     ExpectSameMemory(run);
 }
 
+struct DynImport {
+    std::string Name;
+    std::uint64_t Slot = 0;
+    std::uint32_t Type = 7;
+};
+
+std::vector<std::uint8_t> DynamicElf(std::uint64_t codeVA, const std::vector<std::uint8_t>& code, std::uint64_t dataVA, std::vector<std::uint8_t> data, const std::vector<std::string>& needed, const std::vector<DynImport>& imports) {
+    std::string strings(1, '\0');
+    auto addString = [&](const std::string& text) {
+        const auto offset = strings.size();
+        strings += text;
+        strings.push_back('\0');
+        return static_cast<std::uint32_t>(offset);
+    };
+    std::vector<std::uint32_t> neededOffsets;
+    for (const auto& name : needed) neededOffsets.push_back(addString(name));
+    std::vector<std::uint32_t> symbolOffsets;
+    for (const auto& import : imports) symbolOffsets.push_back(addString(import.Name));
+    const auto append = [&](std::size_t size) {
+        const auto at = data.size();
+        data.resize(at + size);
+        return at;
+    };
+    const auto stringAt = append(strings.size());
+    std::memcpy(data.data() + stringAt, strings.data(), strings.size());
+    const auto symbolAt = append((imports.size() + 1) * 24);
+    for (std::size_t index = 0; index < imports.size(); ++index) {
+        const auto at = symbolAt + (index + 1) * 24;
+        Put(data, at, symbolOffsets[index], 4);
+        data[at + 4] = 0x12;
+    }
+    const auto relaAt = append(imports.size() * 24);
+    for (std::size_t index = 0; index < imports.size(); ++index) {
+        const auto at = relaAt + index * 24;
+        Put(data, at, imports[index].Slot, 8);
+        Put(data, at + 8, (static_cast<std::uint64_t>(index + 1) << 32) | imports[index].Type, 8);
+    }
+    const auto dynamicAt = append((needed.size() + 8) * 16);
+    std::size_t tag = 0;
+    auto dyn = [&](std::uint64_t kind, std::uint64_t value) {
+        const auto at = dynamicAt + tag * 16;
+        ++tag;
+        Put(data, at, kind, 8);
+        Put(data, at + 8, value, 8);
+    };
+    for (const auto offset : neededOffsets) dyn(1, offset);
+    dyn(5, dataVA + stringAt);
+    dyn(10, strings.size());
+    dyn(6, dataVA + symbolAt);
+    dyn(11, 24);
+    dyn(23, dataVA + relaAt);
+    dyn(2, imports.size() * 24);
+    dyn(20, 7);
+    dyn(0, 0);
+    const std::size_t phOff = 64;
+    const std::size_t codeAt = phOff + 56 * 3;
+    const std::size_t dataAt = codeAt + code.size();
+    std::vector<std::uint8_t> elf(dataAt + data.size());
+    elf[0] = 0x7f;
+    elf[1] = 'E';
+    elf[2] = 'L';
+    elf[3] = 'F';
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[6] = 1;
+    Put(elf, 16, 3, 2);
+    Put(elf, 18, 62, 2);
+    Put(elf, 20, 1, 4);
+    Put(elf, 24, codeVA, 8);
+    Put(elf, 32, phOff, 8);
+    Put(elf, 52, 64, 2);
+    Put(elf, 54, 56, 2);
+    Put(elf, 56, 3, 2);
+    auto phdr = [&](std::size_t index, std::uint32_t type, std::uint32_t flags, std::uint64_t offset, std::uint64_t address, std::uint64_t filesz, std::uint64_t memsz) {
+        const auto header = phOff + index * 56;
+        Put(elf, header, type, 4);
+        Put(elf, header + 4, flags, 4);
+        Put(elf, header + 8, offset, 8);
+        Put(elf, header + 16, address, 8);
+        Put(elf, header + 24, address, 8);
+        Put(elf, header + 32, filesz, 8);
+        Put(elf, header + 40, memsz, 8);
+        Put(elf, header + 48, 0x1000, 8);
+    };
+    phdr(0, 1, 5, codeAt, codeVA, code.size(), code.size());
+    phdr(1, 1, 6, dataAt, dataVA, data.size(), data.size());
+    phdr(2, 2, 6, dataAt + dynamicAt, dataVA + dynamicAt, (needed.size() + 8) * 16, (needed.size() + 8) * 16);
+    std::memcpy(elf.data() + codeAt, code.data(), code.size());
+    std::memcpy(elf.data() + dataAt, data.data(), data.size());
+    return elf;
+}
+
+GuestRun RunWasm(const std::vector<std::uint8_t>& elf) {
+    GuestRun run;
+    run.Plan = Relinker::Wasm::PlanWasmImage(elf);
+    static int serial = 0;
+    const auto directory = std::filesystem::temp_directory_path() / ("anyps5-wasm-import-" + std::to_string(getpid()) + "-" + std::to_string(serial++));
+    std::filesystem::create_directories(directory);
+    const auto input = directory / "guest.elf";
+    const auto output = directory / "guest.wasm";
+    const auto script = directory / "run.js";
+    {
+        std::ofstream elfFile(input, std::ios::binary);
+        elfFile.write(reinterpret_cast<const char*>(elf.data()), static_cast<std::streamsize>(elf.size()));
+        std::ofstream scriptFile(script);
+        scriptFile << kNodeScript;
+    }
+    const auto linked = Run({ANYPS5_RELINKER, "--wasm", input.string(), output.string()});
+    if (linked.Status != 0) {
+        std::filesystem::remove_all(directory);
+        Require(false, "relinker --wasm failed: " + linked.Err + linked.Out);
+    }
+    const auto span = static_cast<std::size_t>(run.Plan.GuestLimit - run.Plan.GuestBase);
+    const auto node = Run({ANYPS5_NODE, script.string(), output.string(), std::to_string(span)});
+    std::filesystem::remove_all(directory);
+    Require(node.Status == 0, "node failed: " + node.Err + node.Out);
+    std::istringstream lines(node.Out);
+    std::string statusText, stateText, baseText, limitText, memoryBaseText, stateHex, memoryHex;
+    Require(static_cast<bool>(std::getline(lines, statusText) && std::getline(lines, stateText) && std::getline(lines, baseText) && std::getline(lines, limitText) && std::getline(lines, memoryBaseText) && std::getline(lines, stateHex) && std::getline(lines, memoryHex)), "node dump is incomplete");
+    run.Status = static_cast<int>(std::stoll(statusText));
+    ExpectEqual("state", std::stoull(stateText), Relinker::Wasm::kStateAddress);
+    ExpectEqual("guest base", std::stoull(baseText), run.Plan.GuestBase);
+    ExpectEqual("guest limit", std::stoull(limitText), run.Plan.GuestLimit);
+    run.MemoryBase = std::stoull(memoryBaseText);
+    run.State = FromHex(stateHex);
+    run.WasmMemory = FromHex(memoryHex);
+    Require(run.State.size() == Relinker::Wasm::kStateBytes, "state size");
+    Require(run.WasmMemory.size() == span, "guest memory size");
+    for (int index = 0; index < 16; ++index) run.Gpr[index] = Read64(run.State.data() + index * 8);
+    run.Rip = Read64(run.State.data() + Relinker::Wasm::kRipOffset);
+    run.Flags = Read64(run.State.data() + Relinker::Wasm::kRflagsOffset);
+    return run;
+}
+
+const Relinker::Wasm::WasmImport* FindImport(const Relinker::Wasm::WasmImage& image, const std::string& name) {
+    for (const auto& import : image.Imports) if (import.Name == name) return &import;
+    return nullptr;
+}
+
+void Imports() {
+    constexpr std::uint64_t codeVA = 0x10000;
+    constexpr std::uint64_t dataVA = 0x11000;
+    constexpr std::uint64_t src = dataVA;
+    constexpr std::uint64_t dest = dataVA + 0x10;
+    constexpr std::uint64_t dest2 = dataVA + 0x20;
+    constexpr std::uint64_t results = dataVA + 0x30;
+    constexpr std::uint64_t got = dataVA + 0x60;
+    Asm code;
+    auto movabs = [&](std::uint8_t reg, std::uint64_t value) {
+        code.B({static_cast<std::uint8_t>(reg < 8 ? 0x48 : 0x49), static_cast<std::uint8_t>(0xb8 + (reg & 7))});
+        code.U64(value);
+    };
+    auto storeRax = [&] { code.B({0x48, 0x89, 0x01}); };
+    auto callGot = [&](std::uint64_t slot) {
+        code.B({0xff, 0x15});
+        const auto next = codeVA + code.Bytes.size() + 4;
+        code.U32(static_cast<std::uint32_t>(static_cast<std::int64_t>(slot) - static_cast<std::int64_t>(next)));
+    };
+    movabs(7, dest);
+    movabs(6, src);
+    movabs(2, 2);
+    callGot(got);
+    movabs(1, results);
+    storeRax();
+    movabs(7, dest2);
+    movabs(6, 0x61);
+    movabs(2, 4);
+    callGot(got + 8);
+    movabs(1, results + 8);
+    storeRax();
+    movabs(7, src);
+    callGot(got + 16);
+    movabs(1, results + 16);
+    storeRax();
+    const auto firstCall = code.Bytes.size();
+    code.B({0xe8, 0, 0, 0, 0});
+    movabs(1, results + 24);
+    storeRax();
+    const auto secondCall = code.Bytes.size();
+    code.B({0xe8, 0, 0, 0, 0});
+    movabs(1, results + 32);
+    storeRax();
+    const auto ud2 = codeVA + code.Bytes.size();
+    code.B({0x0f, 0x0b});
+    const auto plt = codeVA + code.Bytes.size();
+    auto patch = [&](std::size_t at) {
+        const auto next = codeVA + at + 5;
+        const auto displacement = static_cast<std::uint32_t>(static_cast<std::int64_t>(plt) - static_cast<std::int64_t>(next));
+        for (int index = 0; index < 4; ++index) code.Bytes[at + 1 + static_cast<std::size_t>(index)] = static_cast<std::uint8_t>(displacement >> (8 * index));
+    };
+    patch(firstCall);
+    patch(secondCall);
+    code.B({0xff, 0x25});
+    const auto jmpNext = codeVA + code.Bytes.size() + 4;
+    code.U32(static_cast<std::uint32_t>(static_cast<std::int64_t>(got + 24) - static_cast<std::int64_t>(jmpNext)));
+    std::vector<std::uint8_t> data(0x80);
+    data[0] = 'h';
+    data[1] = 'i';
+    const std::vector<std::string> needed = {"libSceLibcInternal.sprx", "libkernel.sprx"};
+    const std::vector<DynImport> imports = {{"memcpy", got}, {"memset", got + 8}, {"strlen", got + 16}, {"sceKernelGetProcessTime", got + 24}};
+    const auto elf = DynamicElf(codeVA, code.Bytes, dataVA, data, needed, imports);
+    const auto plan = Relinker::Wasm::PlanWasmImage(elf);
+    Require(plan.Imports.size() == 4, "import count");
+    for (const auto& import : imports) {
+        const auto* bound = FindImport(plan, import.Name);
+        Require(bound != nullptr, "missing import " + import.Name);
+        Require(bound->Nid == Nid::ComputeNid(import.Name, ""), "nid of " + import.Name);
+        const auto& segment = plan.Segments[1];
+        ExpectEqual(import.Name + " slot", Read64(segment.Bytes.data() + static_cast<std::size_t>(import.Slot - dataVA)), bound->Entry);
+    }
+    const auto run = RunWasm(elf);
+    ExpectEqual("import status", run.Status, 0);
+    ExpectEqual("import rip", run.Rip, ud2);
+    ExpectEqual("import rsp", run.Gpr[4], run.Plan.StackTop);
+    const auto memoryAt = dataVA - run.Plan.GuestBase;
+    Require(run.WasmMemory[memoryAt + 0x10] == 'h' && run.WasmMemory[memoryAt + 0x11] == 'i' && run.WasmMemory[memoryAt + 0x12] == 0, "memcpy bytes");
+    Require(run.WasmMemory[memoryAt + 0x20] == 'a' && run.WasmMemory[memoryAt + 0x21] == 'a' && run.WasmMemory[memoryAt + 0x22] == 'a' && run.WasmMemory[memoryAt + 0x23] == 'a', "memset bytes");
+    ExpectEqual("memcpy result", At(run.WasmMemory, run.Plan.GuestBase, results), dest);
+    ExpectEqual("memset result", At(run.WasmMemory, run.Plan.GuestBase, results + 8), dest2);
+    ExpectEqual("strlen result", At(run.WasmMemory, run.Plan.GuestBase, results + 16), 2);
+    const auto first = At(run.WasmMemory, run.Plan.GuestBase, results + 24);
+    const auto second = At(run.WasmMemory, run.Plan.GuestBase, results + 32);
+    Require(second >= first && second < 10000000, "process time was not a short monotonic microsecond count");
+    const auto memcpyNid = Nid::ComputeNid("memcpy", "");
+    const auto strlenNid = Nid::ComputeNid("strlen", "");
+    const auto nidElf = DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {}, {{memcpyNid, dataVA, 6}});
+    const auto nidPlan = Relinker::Wasm::PlanWasmImage(nidElf);
+    const auto* nidImport = FindImport(nidPlan, memcpyNid);
+    Require(nidImport != nullptr && nidImport->Kind == static_cast<std::uint16_t>(Relinker::Wasm::WasmImportKind::Memcpy), "raw NID import");
+    ExpectEqual("glob dat", Read64(nidPlan.Segments[1].Bytes.data()), nidImport->Entry);
+    const auto qualified = strlenNid + "#libSceLibcInternal#A";
+    const auto qualifiedElf = DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {}, {{qualified, dataVA}});
+    const auto* qualifiedImport = FindImport(Relinker::Wasm::PlanWasmImage(qualifiedElf), qualified);
+    Require(qualifiedImport != nullptr && qualifiedImport->Nid == strlenNid && qualifiedImport->Kind == static_cast<std::uint16_t>(Relinker::Wasm::WasmImportKind::Strlen), "qualified NID import");
+    Throws(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {"libc.so.6"}, {{"memcpy", dataVA}}), "undefined");
+    Throws(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {"libSceLibcInternal.sprx"}, {{"malloc", dataVA}}), "undefined");
+    Throws(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {}, {{"memcpy#only", dataVA}}), "qualified");
+    Throws(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {}, {{"memcpy#lib#*", dataVA}}), "module ID");
+}
+
 }
 
 int main() {
@@ -875,6 +1117,7 @@ int main() {
         Flags();
         GuestMemory();
         Fault();
+        Imports();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
