@@ -351,6 +351,12 @@ jobs:
         run: echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
       - if: ${{ matrix.architectures == 'x86_64' }}
         run: arch -x86_64 /usr/bin/true || sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Install the WebAssembly linker
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+          if ! command -v node >/dev/null; then sudo apt-get install -y nodejs; fi
       - run: cmake -S . -B build-relinker -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON -DCMAKE_OSX_ARCHITECTURES=${{ matrix.architectures }}
       - run: cmake --build build-relinker --parallel 3
       - run: |

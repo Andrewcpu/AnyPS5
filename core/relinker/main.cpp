@@ -4,6 +4,7 @@
 #include <relinker/pipeline/Conversion.hpp>
 #include <Cli.hpp>
 #include <domain/Types.hpp>
+#include <wasm/WasmTarget.hpp>
 #include <io/FileReader.hpp>
 #include <io/NativePath.hpp>
 #include <io/FileIdentity.hpp>
@@ -267,6 +268,17 @@ int RunVerifyPatches(const Cli::Args& args) {
     return mismatches == 0 ? 0 : 1;
 }
 
+int RunWasm(const Cli::Args& args) {
+    if (std::filesystem::exists(Io::NativePath(args.inputPath)) && std::filesystem::exists(Io::NativePath(args.outputPath)) && SameOutputFile(Io::NativePath(args.inputPath), Io::NativePath(args.outputPath)))
+        throw Domain::RelinkerException("Executable output would overwrite the input executable");
+    if (Io::NativePath(args.outputPath).filename().empty() || std::filesystem::is_directory(Io::NativePath(args.outputPath)))
+        throw Domain::RelinkerException("Executable output is a directory: " + args.outputPath);
+    const auto module = Relinker::Wasm::CompileWasm(Io::FileReader().Read(args.inputPath));
+    Io::FileWriter().Write(args.outputPath, module);
+    std::cout << "WebAssembly module: " << args.outputPath << '\n';
+    return 0;
+}
+
 int Run(const int argc, char* argv[]) {
     Cli::Args args;
     try {
@@ -288,6 +300,7 @@ int Run(const int argc, char* argv[]) {
 
     Cli::ConsoleProgress progress(std::cout);
     try {
+        if (args.toWasm) return RunWasm(args);
         if (!args.verifyPatchesPath.empty()) return RunVerifyPatches(args);
         auto extension = Io::Utf8Path(Io::NativePath(args.outputPath).extension());
         for (auto& character : extension) if (character >= 'A' && character <= 'Z') character = static_cast<char>(character + ('a' - 'A'));

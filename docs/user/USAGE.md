@@ -46,7 +46,10 @@ source/
 
 ```text
 relinker [options] <input.elf> <output>
+relinker --wasm <input.elf> <output.wasm>
 ```
+
+`relinker --wasm` lifts a freestanding x86-64 ELF to a WebAssembly module. It cannot be combined with the native conversion options, and it does not load PS5 modules. The host needs `clang` and `wasm-ld` as described in [the relinker build](../dev/BUILD.md).
 
 ### Dry run
 
@@ -134,6 +137,7 @@ All switches are disabled by default. `unused-filter` defaults to `0`; `--rpath`
 | `--version`                  | Print the relinker build revision reported by `git describe` to stdout and exit with code `0`; input and output paths are not required. |
 | `--windows`                   | Produce a Windows PE executable.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `--macos`                     | Produce an x86-64 Mach-O executable, with bundled modules as Mach-O libraries under `app0/`, each in the directory it was found in (`sce_module`, `sce_modules`, `prx` or a `--module-dir`). Conflicts with `--windows`.                                                                                                                                                                                                                                                                                                                                             |
+| `--wasm`                      | Lift a freestanding x86-64 ELF to a WebAssembly module. Cannot be combined with the other conversion options. Does not load PS5 modules. |
 | `--windows-diagnostics`       | Write startup dependency diagnostics to `windows-diagnostics-imports.txt` beside the output executable. Requires `--windows`.                                                                                                                                                                                                                                                                                                                                               |
 | `--windows-gui`               | Select the Windows GUI subsystem instead of the console subsystem. Requires `--windows`.                                                                                                                                                                                                                                                                                                                                                                                    |
 | `--windows-fixed-base <address>` | Map the lowest ELF load page at this fixed Windows address instead of the preferred `0x400000`, given in decimal or hexadecimal (`0x`). Requires `--windows`, a 64 KiB-aligned address from `0x20000` through `0x7fffffff0000`, and a complete image fitting in the user address space. The main executable has no ASLR or base relocations; an occupied address fails to load. Bundled modules keep their normal placement. |

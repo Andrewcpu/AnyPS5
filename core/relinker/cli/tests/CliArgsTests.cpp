@@ -53,7 +53,7 @@ void defaults() {
     require(args.inputPath == "input.elf", "input path was not captured");
     require(args.outputPath == "output.elf", "output path was not captured");
     require(!args.dryRun && !args.skipSyscallCheck && !args.trapSdkSyscallStubs && !args.skipSceModule && !args.toIntel && !args.writeRegistry &&
-        !args.toWindows && !args.lazyBinding && !args.autorun && !args.windowsDiagnostics && !args.windowsGui,
+        !args.toWindows && !args.toWasm && !args.lazyBinding && !args.autorun && !args.windowsDiagnostics && !args.windowsGui,
         "a flag defaulted to true");
     require(args.unusedFilterLevel == 0u, "unused filter level did not default to 0");
     require(args.runPath == "$ORIGIN/libs", "run path did not keep its default");
@@ -383,6 +383,15 @@ void verifyMode() {
     expectUsage({"--verify-patches", "p.toml"});
 }
 
+void wasmMode() {
+    const auto args = parse({"--wasm", "input.elf", "output.wasm"});
+    require(args.toWasm && !args.toWindows && !args.toMacos && args.inputPath == "input.elf" && args.outputPath == "output.wasm", "--wasm was ignored");
+    require(args.sceModulePath.empty(), "--wasm selected a module directory");
+    expectThrows({"--wasm", "--windows", "input.elf", "output.wasm"}, "--wasm cannot be combined with other options");
+    expectThrows({"--wasm", "--dry-run", "input.elf", "output.wasm"}, "--wasm cannot be combined with other options");
+    expectThrows({"--verify-patches", "p.toml", "--wasm", "in.elf"}, "--wasm cannot be used with --verify-patches");
+}
+
 void dryRun() {
     for (const auto* target : {"--windows", "--macos"}) {
         const auto args = parse({"input.elf", "--dry-run", target, "--registry", "output"});
@@ -400,6 +409,7 @@ void dryRun() {
 int main() {
     try {
         defaults();
+        wasmMode();
         dryRun();
         booleanFlags();
         trapSdkSyscallStubs();
