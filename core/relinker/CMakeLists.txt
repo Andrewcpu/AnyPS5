@@ -228,6 +228,7 @@ endif()
 
 add_library(relinker_wasm_aot STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Image.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Relocate.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Decode.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Discover.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Lift.cpp

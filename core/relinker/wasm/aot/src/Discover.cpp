@@ -17,10 +17,10 @@ struct Span {
 
 Span ExecutableBytes(const WasmImage& image, std::uint64_t address) {
     for (const auto& segment : image.Segments) {
-        if ((segment.Flags & 1u) == 0) continue;
-        if (address < segment.Virtual || address >= segment.Virtual + segment.Bytes.size()) continue;
+        if ((segment.Flags & 1u) == 0 || segment.FileSize == 0) continue;
+        if (address < segment.Virtual || address >= segment.Virtual + segment.FileSize) continue;
         const auto offset = static_cast<std::size_t>(address - segment.Virtual);
-        return {segment.Bytes.data() + offset, segment.Bytes.size() - offset};
+        return {segment.Bytes.data() + offset, static_cast<std::size_t>(segment.FileSize - offset)};
     }
     Fail("control flow leaves executable bytes");
     return {};

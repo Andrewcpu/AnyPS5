@@ -105,9 +105,10 @@ int ScaleShift(int scale) {
 
 class Ir {
 public:
-    explicit Ir(std::uint64_t guestLimit) : guestLimit(guestLimit) {}
+    explicit Ir(std::uint64_t guestBase, std::uint64_t guestLimit) : guestBase(guestBase), guestLimit(guestLimit) {}
 
     std::string Text;
+    std::uint64_t guestBase;
     std::uint64_t guestLimit;
 
     std::string Temp() { return "%t" + std::to_string(temp++); }
@@ -191,15 +192,23 @@ public:
     void StoreXmm(int reg, int half, const std::string& value) { Store("i64", value, StatePtr(kXmmOffset + static_cast<std::uint64_t>(reg) * 16 + static_cast<std::uint64_t>(half) * 8)); }
     void StoreRip(const std::string& value) { Store("i64", value, StatePtr(kRipOffset)); }
 
-    std::string Check(const std::string& address, int size) {
+    void Guard(const std::string& address, int size, std::uint64_t rip) {
+        StoreRip(Const(rip));
         const auto end = Add(address, Const(static_cast<std::uint64_t>(size)));
         const auto wrap = Icmp("ult", end, address);
-        const auto high = Icmp("ugt", end, Const(guestLimit));
-        const auto bad = BitOp("or", wrap, high);
+        const auto below = Icmp("ult", address, Const(guestBase));
+        const auto above = Icmp("ugt", end, Const(guestLimit));
+        const auto low = BitOp("or", wrap, below);
+        const auto bad = BitOp("or", low, above);
         const auto ok = "ok" + std::to_string(label++);
         Line("br i1 " + bad + ", label %fault, label %" + ok);
         Label(ok);
-        return IntToPtr(Trunc32(address));
+    }
+
+    std::string Translate(const std::string& address) {
+        const auto name = Temp();
+        Line(name + " = call i32 @anyps5_translate(i64 " + address + ")");
+        return name;
     }
 
     void Branch(const std::string& target) { Line("br label %" + target); }
@@ -236,16 +245,28 @@ std::string Mask(Ir& ir, std::string value, int width) {
     return ir.And(std::move(value), ir.Const(0xffffffffu));
 }
 
-std::string LoadMem(Ir& ir, const std::string& address, int width) {
-    const auto pointer = ir.Check(address, width / 8);
-    if (width == 32) return ir.Zext64(ir.Load("i32", pointer));
-    return ir.Load("i64", pointer);
+std::string LoadMem(Ir& ir, const std::string& address, int width, std::uint64_t rip) {
+    ir.Guard(address, width / 8, rip);
+    const auto wasm = ir.Translate(address);
+    if (width == 32) {
+        const auto raw = ir.Temp();
+        ir.Line(raw + " = call i32 @anyps5_read32(i32 " + wasm + ")");
+        return ir.Zext64(raw);
+    }
+    const auto raw = ir.Temp();
+    ir.Line(raw + " = call i64 @anyps5_read64(i32 " + wasm + ")");
+    return raw;
 }
 
-void StoreMem(Ir& ir, const std::string& address, const std::string& value, int width) {
-    const auto pointer = ir.Check(address, width / 8);
-    if (width == 32) ir.Store("i32", ir.Trunc32(value), pointer);
-    else ir.Store("i64", value, pointer);
+void StoreMem(Ir& ir, const std::string& address, const std::string& value, int width, std::uint64_t rip) {
+    ir.Guard(address, width / 8, rip);
+    const auto wasm = ir.Translate(address);
+    if (width == 32) {
+        const auto low = ir.Trunc32(value);
+        ir.Line("call void @anyps5_write32(i32 " + wasm + ", i32 " + low + ")");
+        return;
+    }
+    ir.Line("call void @anyps5_write64(i32 " + wasm + ", i64 " + value + ")");
 }
 
 std::string LoadOperand(Ir& ir, const WasmInsn& insn, const WasmOperand& operand, int width) {
@@ -254,7 +275,7 @@ std::string LoadOperand(Ir& ir, const WasmInsn& insn, const WasmOperand& operand
         if (operand.Xmm) return ir.LoadXmm(operand.Reg, 0);
         return Mask(ir, ir.LoadGpr(operand.Reg), width);
     }
-    return LoadMem(ir, AddressOf(ir, insn, operand), width);
+    return LoadMem(ir, AddressOf(ir, insn, operand), width, insn.Address);
 }
 
 void StoreOperand(Ir& ir, const WasmInsn& insn, const WasmOperand& operand, const std::string& value, int width) {
@@ -263,7 +284,7 @@ void StoreOperand(Ir& ir, const WasmInsn& insn, const WasmOperand& operand, cons
         else ir.StoreGpr(operand.Reg, value);
         return;
     }
-    StoreMem(ir, AddressOf(ir, insn, operand), value, width);
+    StoreMem(ir, AddressOf(ir, insn, operand), value, width, insn.Address);
 }
 
 int FlagKind(WasmMnemonic op) {
@@ -336,10 +357,16 @@ void LoadXmmPair(Ir& ir, const WasmInsn& insn, const WasmOperand& operand, std::
         return;
     }
     const auto address = AddressOf(ir, insn, operand);
-    const auto pointer = ir.Check(address, 16);
-    low = ir.Load("i64", pointer);
+    ir.Guard(address, 16, insn.Address);
+    const auto lowWasm = ir.Translate(address);
+    const auto lowRaw = ir.Temp();
+    ir.Line(lowRaw + " = call i64 @anyps5_read64(i32 " + lowWasm + ")");
+    low = lowRaw;
     const auto highAddress = ir.Add(address, ir.Const(8));
-    high = ir.Load("i64", ir.IntToPtr(ir.Trunc32(highAddress)));
+    const auto highWasm = ir.Translate(highAddress);
+    const auto highRaw = ir.Temp();
+    ir.Line(highRaw + " = call i64 @anyps5_read64(i32 " + highWasm + ")");
+    high = highRaw;
 }
 
 void EmitXmm(Ir& ir, const WasmInsn& insn) {
@@ -390,13 +417,20 @@ void EmitInsn(Ir& ir, const WasmInsn& insn) {
         const auto value = LoadOperand(ir, insn, insn.Src, 64);
         const auto rsp = ir.LoadGpr(kRsp);
         const auto slot = ir.Sub(rsp, ir.Const(8));
-        StoreMem(ir, slot, value, 64);
+        StoreMem(ir, slot, value, 64, insn.Address);
+        ir.StoreGpr(kRsp, slot);
+        return;
+    }
+    case WasmMnemonic::PushFlags: {
+        const auto rsp = ir.LoadGpr(kRsp);
+        const auto slot = ir.Sub(rsp, ir.Const(8));
+        StoreMem(ir, slot, ir.LoadFlags(), 64, insn.Address);
         ir.StoreGpr(kRsp, slot);
         return;
     }
     case WasmMnemonic::Pop: {
         const auto rsp = ir.LoadGpr(kRsp);
-        const auto value = LoadMem(ir, rsp, 64);
+        const auto value = LoadMem(ir, rsp, 64, insn.Address);
         ir.StoreGpr(kRsp, ir.Add(rsp, ir.Const(8)));
         StoreOperand(ir, insn, insn.Dst, value, 64);
         return;
@@ -437,21 +471,47 @@ void EmitEdge(Ir& ir, const WasmBlock& block) {
     if (block.EdgeKind == WasmBlock::Kind::Call) {
         const auto rsp = ir.LoadGpr(kRsp);
         const auto slot = ir.Sub(rsp, ir.Const(8));
-        StoreMem(ir, slot, ir.Const(block.Fall), 64);
+        StoreMem(ir, slot, ir.Const(block.Fall), 64, block.Edge);
         ir.StoreGpr(kRsp, slot);
         ir.StoreRip(ir.Const(block.Target));
         ir.Branch("dispatch");
         return;
     }
     const auto rsp = ir.LoadGpr(kRsp);
-    const auto next = LoadMem(ir, rsp, 64);
+    const auto next = LoadMem(ir, rsp, 64, block.Edge);
     ir.StoreGpr(kRsp, ir.Add(rsp, ir.Const(8)));
     ir.StoreRip(next);
     ir.Branch("dispatch");
 }
 
-std::string Pointer(std::uint64_t address) {
-    return "inttoptr (i32 " + std::to_string(static_cast<std::uint32_t>(address)) + " to ptr)";
+std::string MemoryHelpers(std::uint64_t guestBase) {
+    std::string text;
+    text += "define internal i32 @anyps5_translate(i64 %guest) {\n";
+    text += "  %delta = sub i64 %guest, " + Number(guestBase) + "\n";
+    text += "  %sum = add i64 %delta, " + Number(kWasmGuestBase) + "\n";
+    text += "  %wasm = trunc i64 %sum to i32\n";
+    text += "  ret i32 %wasm\n}\n";
+    text += "define internal i32 @anyps5_read32(i32 %wasm) {\n";
+    text += "  %ptr = inttoptr i32 %wasm to ptr\n";
+    text += "  %value = load i32, ptr %ptr, align 1\n";
+    text += "  ret i32 %value\n}\n";
+    text += "define internal i64 @anyps5_read64(i32 %wasm) {\n";
+    text += "  %ptr = inttoptr i32 %wasm to ptr\n";
+    text += "  %value = load i64, ptr %ptr, align 1\n";
+    text += "  ret i64 %value\n}\n";
+    text += "define internal void @anyps5_write32(i32 %wasm, i32 %value) {\n";
+    text += "  %ptr = inttoptr i32 %wasm to ptr\n";
+    text += "  store i32 %value, ptr %ptr, align 1\n";
+    text += "  ret void\n}\n";
+    text += "define internal void @anyps5_write64(i32 %wasm, i64 %value) {\n";
+    text += "  %ptr = inttoptr i32 %wasm to ptr\n";
+    text += "  store i64 %value, ptr %ptr, align 1\n";
+    text += "  ret void\n}\n";
+    return text;
+}
+
+std::vector<std::uint8_t> Content(const WasmSegment& segment) {
+    return {segment.Bytes.begin(), segment.Bytes.begin() + static_cast<std::ptrdiff_t>(segment.ContentSize)};
 }
 
 }
@@ -474,17 +534,22 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
     module += "@anyps5_steps = global i32 0\n";
     for (std::size_t index = 0; index < image.Segments.size(); ++index) {
         const auto& segment = image.Segments[index];
-        if (segment.Bytes.empty()) continue;
-        module += "@seg" + std::to_string(index) + " = private unnamed_addr constant [" + std::to_string(segment.Bytes.size()) + " x i8] " + LlvmBytes(segment.Bytes) + "\n";
+        if (segment.ContentSize == 0) continue;
+        const auto bytes = Content(segment);
+        module += "@seg" + std::to_string(index) + " = private unnamed_addr constant [" + std::to_string(bytes.size()) + " x i8] " + LlvmBytes(bytes) + "\n";
     }
+    module += MemoryHelpers(image.GuestBase);
     module += kFlags;
     module += "\ndefine i32 @anyps5_run() {\nentry:\n";
-    Ir ir(image.GuestLimit);
-    ir.Line("call void @anyps5_memset(ptr " + Pointer(0) + ", i32 " + std::to_string(static_cast<std::uint32_t>(image.GuestLimit)) + ")");
+    Ir ir(image.GuestBase, image.GuestLimit);
+    const auto span = static_cast<std::uint32_t>(image.GuestLimit - image.GuestBase);
+    const auto base = ir.IntToPtr(ir.Translate(Number(image.GuestBase)));
+    ir.Line("call void @anyps5_memset(ptr " + base + ", i32 " + std::to_string(span) + ")");
     for (std::size_t index = 0; index < image.Segments.size(); ++index) {
         const auto& segment = image.Segments[index];
-        if (segment.Bytes.empty()) continue;
-        ir.Line("call void @anyps5_memcpy(ptr " + Pointer(segment.Virtual) + ", ptr @seg" + std::to_string(index) + ", i32 " + std::to_string(segment.Bytes.size()) + ")");
+        if (segment.ContentSize == 0) continue;
+        const auto dest = ir.IntToPtr(ir.Translate(Number(segment.Virtual)));
+        ir.Line("call void @anyps5_memcpy(ptr " + dest + ", ptr @seg" + std::to_string(index) + ", i32 " + std::to_string(static_cast<std::uint32_t>(segment.ContentSize)) + ")");
     }
     for (int reg = 0; reg < 16; ++reg) {
         ir.StoreGpr(reg, ir.Const(0));
@@ -525,8 +590,9 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
     module += ir.Text;
     module += "}\n\n";
     module += "define i32 @anyps5_state() { ret i32 " + std::to_string(static_cast<std::uint32_t>(kStateAddress)) + " }\n";
-    module += "define i32 @anyps5_guest_base() { ret i32 " + std::to_string(static_cast<std::uint32_t>(image.GuestBase)) + " }\n";
-    module += "define i32 @anyps5_guest_limit() { ret i32 " + std::to_string(static_cast<std::uint32_t>(image.GuestLimit)) + " }\n";
+    module += "define i64 @anyps5_guest_base() { ret i64 " + Number(image.GuestBase) + " }\n";
+    module += "define i64 @anyps5_guest_limit() { ret i64 " + Number(image.GuestLimit) + " }\n";
+    module += "define i32 @anyps5_memory_base() { ret i32 " + std::to_string(static_cast<std::uint32_t>(kWasmGuestBase)) + " }\n";
     return module;
 }
 

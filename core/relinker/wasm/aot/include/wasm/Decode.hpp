@@ -21,6 +21,7 @@ enum class WasmMnemonic : std::uint8_t {
     Inc,
     Dec,
     Push,
+    PushFlags,
     Pop,
     Jmp,
     Jcc,

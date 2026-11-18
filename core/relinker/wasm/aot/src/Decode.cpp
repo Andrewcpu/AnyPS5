@@ -260,6 +260,7 @@ WasmInsn DecodePrimary(Reader& reader, int opcode, const Rex& rex) {
     if (opcode == 0xF4 || opcode == 0xCC) return Finish(reader, WasmMnemonic::Halt, 64, {}, {});
     if (opcode >= 0x50 && opcode <= 0x57) return Finish(reader, WasmMnemonic::Push, 64, {}, Register(Extend(opcode & 7, rex.B)));
     if (opcode >= 0x58 && opcode <= 0x5f) return Finish(reader, WasmMnemonic::Pop, 64, Register(Extend(opcode & 7, rex.B)), {});
+    if (opcode == 0x9c) return Finish(reader, WasmMnemonic::PushFlags, 64, {}, {});
     if (opcode >= 0x70 && opcode <= 0x7f) {
         const auto target = Relative(reader, static_cast<std::int8_t>(reader.Take()));
         return Finish(reader, WasmMnemonic::Jcc, 64, {}, {}, static_cast<std::uint8_t>(opcode & 0xf), target);

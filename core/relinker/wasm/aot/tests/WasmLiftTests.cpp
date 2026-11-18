@@ -16,6 +16,7 @@
 #include <sys/wait.h>
 #include <ucontext.h>
 #include <unistd.h>
+#include <initializer_list>
 #include <vector>
 #include <csignal>
 #include <setjmp.h>
@@ -261,13 +262,16 @@ const status = instance.exports.anyps5_run();
 const state = instance.exports.anyps5_state();
 const base = instance.exports.anyps5_guest_base();
 const limit = instance.exports.anyps5_guest_limit();
+const memoryBase = instance.exports.anyps5_memory_base();
+const span = Number(process.argv[3]);
 const memory = new Uint8Array(instance.exports.memory.buffer);
 function hex(start, length) {
   let text = '';
   for (let index = 0; index < length; index += 1) text += memory[start + index].toString(16).padStart(2, '0');
   return text;
 }
-process.stdout.write(String(status) + '\n' + String(state) + '\n' + String(base) + '\n' + String(limit) + '\n' + hex(state, 400) + '\n' + hex(base, limit - base) + '\n');
+function text(value) { return typeof value === 'bigint' ? value.toString() : String(value); }
+process.stdout.write(text(status) + '\n' + text(state) + '\n' + text(base) + '\n' + text(limit) + '\n' + text(memoryBase) + '\n' + hex(state, 400) + '\n' + hex(memoryBase, span) + '\n');
 )";
 
 void Unsupported() {
@@ -305,7 +309,6 @@ void Milestone() {
     std::vector<std::uint8_t> module((std::istreambuf_iterator<char>(wasm)), std::istreambuf_iterator<char>());
     Require(module.size() >= 4 && module[0] == 0 && module[1] == 'a' && module[2] == 's' && module[3] == 'm', "output is not a WebAssembly module");
 
-    ArmSignals();
     for (const auto& segment : plan.Segments) {
         MapRange(segment.Virtual, segment.Virtual + segment.MemorySize, PROT_READ | PROT_WRITE | PROT_EXEC, segment.Bytes.data(), segment.Bytes.size());
     }
@@ -317,20 +320,23 @@ void Milestone() {
     Require(captured.Signal == SIGILL, "native guest stopped with signal " + std::to_string(captured.Signal));
     CheckState("native", captured.Gpr, captured.Rip, captured.Flags, captured.Xmm);
 
-    const auto node = Run({ANYPS5_NODE, script.string(), output.string()});
+    const auto node = Run({ANYPS5_NODE, script.string(), output.string(), std::to_string(plan.GuestLimit - plan.GuestBase)});
     Require(node.Status == 0, "node failed: " + node.Err);
     std::istringstream lines(node.Out);
-    std::string statusText, stateText, baseText, limitText, stateHex, memoryHex;
+    std::string statusText, stateText, baseText, limitText, memoryBaseText, stateHex, memoryHex;
     Require(static_cast<bool>(std::getline(lines, statusText)), "node dump is incomplete");
     Require(static_cast<bool>(std::getline(lines, stateText)), "node dump is incomplete");
     Require(static_cast<bool>(std::getline(lines, baseText)), "node dump is incomplete");
     Require(static_cast<bool>(std::getline(lines, limitText)), "node dump is incomplete");
+    Require(static_cast<bool>(std::getline(lines, memoryBaseText)), "node dump is incomplete");
     Require(static_cast<bool>(std::getline(lines, stateHex)), "node dump is incomplete");
     Require(static_cast<bool>(std::getline(lines, memoryHex)), "node dump is incomplete");
     ExpectEqual("wasm status", std::stoull(statusText), 0);
     ExpectEqual("state", std::stoull(stateText), Relinker::Wasm::kStateAddress);
     ExpectEqual("guest base", std::stoull(baseText), plan.GuestBase);
     ExpectEqual("guest limit", std::stoull(limitText), plan.GuestLimit);
+    ExpectEqual("memory base", std::stoull(memoryBaseText), Relinker::Wasm::kWasmGuestBase);
+    Require(std::stoull(memoryBaseText) != plan.GuestBase, "guest address was used as a wasm pointer");
     const auto state = FromHex(stateHex);
     const auto memory = FromHex(memoryHex);
     Require(state.size() == Relinker::Wasm::kStateBytes, "state size");
@@ -356,12 +362,519 @@ void Milestone() {
     munmap(reinterpret_cast<void*>(plan.GuestBase & ~std::uint64_t{0xfff}), static_cast<std::size_t>(((plan.StackTop + 0xfff) & ~std::uint64_t{0xfff}) - (plan.GuestBase & ~std::uint64_t{0xfff})));
 }
 
+constexpr std::uint64_t kFlagMask = 0xad7;
+constexpr std::uint64_t kLogicalMask = 0xac7;
+
+struct Asm {
+    std::vector<std::uint8_t> Bytes;
+    void B(std::initializer_list<std::uint8_t> bytes) { Bytes.insert(Bytes.end(), bytes.begin(), bytes.end()); }
+    void U32(std::uint32_t value) { for (int index = 0; index < 4; ++index) Bytes.push_back(static_cast<std::uint8_t>(value >> (8 * index))); }
+    void U64(std::uint64_t value) { for (int index = 0; index < 8; ++index) Bytes.push_back(static_cast<std::uint8_t>(value >> (8 * index))); }
+};
+
+struct GuestRun {
+    Relinker::Wasm::WasmImage Plan;
+    Capture Native;
+    int Status = 0;
+    std::uint64_t MemoryBase = 0;
+    std::vector<std::uint8_t> State;
+    std::vector<std::uint8_t> WasmMemory;
+    std::vector<std::uint8_t> NativeMemory;
+    std::uint64_t Gpr[16]{};
+    std::uint64_t Rip = 0;
+    std::uint64_t Flags = 0;
+    std::uint8_t Xmm[16][16]{};
+};
+
+std::uint32_t Read32(const std::uint8_t* bytes) {
+    std::uint32_t value = 0;
+    for (int index = 0; index < 4; ++index) value |= static_cast<std::uint32_t>(bytes[index]) << (8 * index);
+    return value;
+}
+
+std::uint64_t At(const std::vector<std::uint8_t>& memory, std::uint64_t base, std::uint64_t address) {
+    return Read64(memory.data() + static_cast<std::size_t>(address - base));
+}
+
+void ExpectFlags(const std::string& name, std::uint64_t native, std::uint64_t wasm, bool logical) {
+    ExpectEqual(name, wasm & (logical ? kLogicalMask : kFlagMask), native & (logical ? kLogicalMask : kFlagMask));
+}
+
+GuestRun RunGuest(const std::vector<std::uint8_t>& elf) {
+    GuestRun run;
+    run.Plan = Relinker::Wasm::PlanWasmImage(elf);
+    static int serial = 0;
+    const auto directory = std::filesystem::temp_directory_path() / ("anyps5-wasm-mem-" + std::to_string(getpid()) + "-" + std::to_string(serial++));
+    std::filesystem::create_directories(directory);
+    const auto input = directory / "guest.elf";
+    const auto output = directory / "guest.wasm";
+    const auto script = directory / "run.js";
+    {
+        std::ofstream elfFile(input, std::ios::binary);
+        elfFile.write(reinterpret_cast<const char*>(elf.data()), static_cast<std::streamsize>(elf.size()));
+        std::ofstream scriptFile(script);
+        scriptFile << kNodeScript;
+    }
+    const auto linked = Run({ANYPS5_RELINKER, "--wasm", input.string(), output.string()});
+    if (linked.Status != 0) {
+        std::filesystem::remove_all(directory);
+        Require(false, "relinker --wasm failed: " + linked.Err + linked.Out);
+    }
+    const auto span = static_cast<std::size_t>(run.Plan.GuestLimit - run.Plan.GuestBase);
+    const auto page = run.Plan.GuestBase & ~std::uint64_t{0xfff};
+    const auto limit = (run.Plan.GuestLimit + 0xfff) & ~std::uint64_t{0xfff};
+    auto* mapped = mmap(reinterpret_cast<void*>(page), static_cast<std::size_t>(limit - page), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    Require(mapped == reinterpret_cast<void*>(page), "mmap failed");
+    for (const auto& segment : run.Plan.Segments) std::memcpy(reinterpret_cast<void*>(segment.Virtual), segment.Bytes.data(), segment.Bytes.size());
+    std::memset(&captured, 0, sizeof(captured));
+    alarm(5);
+    if (sigsetjmp(guestJump, 1) == 0) Anyps5EnterGuest(run.Plan.Entry, run.Plan.StackTop);
+    alarm(0);
+    asm volatile("" ::: "memory");
+    run.Native = captured;
+    run.NativeMemory.resize(span);
+    std::memcpy(run.NativeMemory.data(), reinterpret_cast<const void*>(run.Plan.GuestBase), span);
+    munmap(mapped, static_cast<std::size_t>(limit - page));
+    const auto node = Run({ANYPS5_NODE, script.string(), output.string(), std::to_string(span)});
+    std::filesystem::remove_all(directory);
+    Require(node.Status == 0, "node failed: " + node.Err + node.Out);
+    std::istringstream lines(node.Out);
+    std::string statusText, stateText, baseText, limitText, memoryBaseText, stateHex, memoryHex;
+    Require(static_cast<bool>(std::getline(lines, statusText) && std::getline(lines, stateText) && std::getline(lines, baseText) && std::getline(lines, limitText) && std::getline(lines, memoryBaseText) && std::getline(lines, stateHex) && std::getline(lines, memoryHex)), "node dump is incomplete");
+    run.Status = static_cast<int>(std::stoll(statusText));
+    ExpectEqual("state", std::stoull(stateText), Relinker::Wasm::kStateAddress);
+    ExpectEqual("guest base", std::stoull(baseText), run.Plan.GuestBase);
+    ExpectEqual("guest limit", std::stoull(limitText), run.Plan.GuestLimit);
+    run.MemoryBase = std::stoull(memoryBaseText);
+    ExpectEqual("memory base", run.MemoryBase, Relinker::Wasm::kWasmGuestBase);
+    if (run.Plan.GuestBase != 0) Require(run.MemoryBase != run.Plan.GuestBase, "guest address was used as a wasm pointer");
+    run.State = FromHex(stateHex);
+    run.WasmMemory = FromHex(memoryHex);
+    Require(run.State.size() == Relinker::Wasm::kStateBytes, "state size");
+    Require(run.WasmMemory.size() == span, "guest memory size");
+    for (int index = 0; index < 16; ++index) run.Gpr[index] = Read64(run.State.data() + index * 8);
+    run.Rip = Read64(run.State.data() + Relinker::Wasm::kRipOffset);
+    run.Flags = Read64(run.State.data() + Relinker::Wasm::kRflagsOffset);
+    for (int reg = 0; reg < 16; ++reg) std::memcpy(run.Xmm[reg], run.State.data() + Relinker::Wasm::kXmmOffset + static_cast<std::size_t>(reg) * 16, 16);
+    return run;
+}
+
+void ExpectSameMemory(const GuestRun& run) {
+    Require(run.NativeMemory.size() == run.WasmMemory.size(), "memory length");
+    for (std::size_t index = 0; index < run.NativeMemory.size(); ++index) {
+        if (run.NativeMemory[index] == run.WasmMemory[index]) continue;
+        ExpectEqual("memory " + std::to_string(run.Plan.GuestBase + index), run.WasmMemory[index], run.NativeMemory[index]);
+    }
+}
+
+struct ElfLoad {
+    std::uint64_t Virtual = 0;
+    std::uint32_t Flags = 5;
+    std::uint64_t Memory = 0;
+    std::vector<std::uint8_t> Bytes;
+};
+
+struct ElfSym {
+    std::uint64_t Value = 0;
+    std::uint16_t Section = 0;
+    std::uint8_t Info = 0x10;
+};
+
+struct ElfRel {
+    std::uint64_t Offset = 0;
+    std::uint32_t Type = 0;
+    std::uint32_t Symbol = 0;
+    std::int64_t Addend = 0;
+};
+
+void Add(std::vector<std::uint8_t>& bytes, std::uint64_t value, int size) {
+    for (int index = 0; index < size; ++index) bytes.push_back(static_cast<std::uint8_t>(value >> (8 * index)));
+}
+
+void Shdr(std::vector<std::uint8_t>& bytes, std::uint32_t type, std::uint64_t flags, std::uint64_t address, std::uint64_t offset, std::uint64_t size, std::uint32_t link, std::uint32_t info, std::uint64_t entsize) {
+    Add(bytes, 0, 4);
+    Add(bytes, type, 4);
+    Add(bytes, flags, 8);
+    Add(bytes, address, 8);
+    Add(bytes, offset, 8);
+    Add(bytes, size, 8);
+    Add(bytes, link, 4);
+    Add(bytes, info, 4);
+    Add(bytes, 1, 8);
+    Add(bytes, entsize, 8);
+}
+
+std::vector<std::uint8_t> MakeElf(std::uint64_t entry, std::uint16_t kind, const std::vector<ElfLoad>& loads, const std::vector<ElfSym>& symbols, const std::vector<ElfRel>& relocs, bool useRel) {
+    const bool sections = !symbols.empty() || !relocs.empty() || useRel;
+    const int relCount = useRel && relocs.empty() ? 1 : static_cast<int>(relocs.size());
+    const int relEnt = useRel ? 16 : 24;
+    const std::size_t phOff = 64;
+    std::size_t cursor = phOff + 56 * loads.size();
+    std::vector<std::size_t> loadAt(loads.size());
+    for (std::size_t index = 0; index < loads.size(); ++index) {
+        loadAt[index] = cursor;
+        cursor += loads[index].Bytes.size();
+    }
+    const auto symAt = cursor;
+    const auto symBytes = sections ? (symbols.size() + 1) * 24 : 0;
+    cursor += symBytes;
+    const auto strAt = cursor;
+    const auto strBytes = sections ? std::size_t{1} : 0;
+    cursor += strBytes;
+    const auto relAt = cursor;
+    const auto relBytes = sections ? static_cast<std::size_t>(relCount) * static_cast<std::size_t>(relEnt) : 0;
+    cursor += relBytes;
+    const auto shAt = cursor;
+    const int shnum = sections ? static_cast<int>(loads.size()) + 4 : 0;
+    std::vector<std::uint8_t> elf(shAt + static_cast<std::size_t>(shnum) * 64);
+    elf[0] = 0x7f;
+    elf[1] = 'E';
+    elf[2] = 'L';
+    elf[3] = 'F';
+    elf[4] = 2;
+    elf[5] = 1;
+    elf[6] = 1;
+    Put(elf, 16, kind, 2);
+    Put(elf, 18, 62, 2);
+    Put(elf, 20, 1, 4);
+    Put(elf, 24, entry, 8);
+    Put(elf, 32, phOff, 8);
+    Put(elf, 40, sections ? shAt : 0, 8);
+    Put(elf, 52, 64, 2);
+    Put(elf, 54, 56, 2);
+    Put(elf, 56, loads.size(), 2);
+    Put(elf, 58, 64, 2);
+    Put(elf, 60, static_cast<std::uint64_t>(shnum), 2);
+    for (std::size_t index = 0; index < loads.size(); ++index) {
+        const auto header = phOff + index * 56;
+        const auto memory = loads[index].Memory == 0 ? loads[index].Bytes.size() : loads[index].Memory;
+        Put(elf, header, 1, 4);
+        Put(elf, header + 4, loads[index].Flags, 4);
+        Put(elf, header + 8, loadAt[index], 8);
+        Put(elf, header + 16, loads[index].Virtual, 8);
+        Put(elf, header + 24, loads[index].Virtual, 8);
+        Put(elf, header + 32, loads[index].Bytes.size(), 8);
+        Put(elf, header + 40, memory, 8);
+        Put(elf, header + 48, 0x1000, 8);
+        std::memcpy(elf.data() + loadAt[index], loads[index].Bytes.data(), loads[index].Bytes.size());
+    }
+    if (!sections) return elf;
+    const auto symtab = loads.size() + 1;
+    const auto strtab = symtab + 1;
+    for (std::size_t index = 0; index < symbols.size(); ++index) {
+        const auto at = symAt + (index + 1) * 24;
+        elf[at + 4] = symbols[index].Info;
+        Put(elf, at + 6, symbols[index].Section, 2);
+        Put(elf, at + 8, symbols[index].Value, 8);
+    }
+    for (std::size_t index = 0; index < relocs.size(); ++index) {
+        const auto at = relAt + index * static_cast<std::size_t>(relEnt);
+        Put(elf, at, relocs[index].Offset, 8);
+        Put(elf, at + 8, (static_cast<std::uint64_t>(relocs[index].Symbol) << 32) | relocs[index].Type, 8);
+        if (!useRel) Put(elf, at + 16, static_cast<std::uint64_t>(relocs[index].Addend), 8);
+    }
+    const auto shdr = elf.data() + shAt;
+    (void)shdr;
+    std::vector<std::uint8_t> headers;
+    Shdr(headers, 0, 0, 0, 0, 0, 0, 0, 0);
+    for (std::size_t index = 0; index < loads.size(); ++index) {
+        std::uint64_t flags = 2;
+        if ((loads[index].Flags & 1u) != 0) flags |= 4;
+        if ((loads[index].Flags & 2u) != 0) flags |= 1;
+        Shdr(headers, 1, flags, loads[index].Virtual, loadAt[index], loads[index].Bytes.size(), 0, 0, 0);
+    }
+    Shdr(headers, 2, 0, 0, symAt, symBytes, static_cast<std::uint32_t>(strtab), 1, 24);
+    Shdr(headers, 3, 0, 0, strAt, strBytes, 0, 0, 0);
+    Shdr(headers, useRel ? 9 : 4, 0, 0, relAt, relBytes, static_cast<std::uint32_t>(symtab), 0, static_cast<std::uint64_t>(relEnt));
+    Require(headers.size() == static_cast<std::size_t>(shnum) * 64, "section header size");
+    std::memcpy(elf.data() + shAt, headers.data(), headers.size());
+    return elf;
+}
+
+std::vector<ElfLoad> BaseLoads(std::uint64_t base) {
+    return {{base, 5, 2, {0x0f, 0x0b}}, {base + 0x1000, 6, 16, std::vector<std::uint8_t>(16)}};
+}
+
+void Throws(const std::vector<std::uint8_t>& elf, const char* text) {
+    bool threw = false;
+    try {
+        (void)Relinker::Wasm::PlanWasmImage(elf);
+    } catch (const std::exception& error) {
+        threw = true;
+        Require(std::string(error.what()).find(text) != std::string::npos, std::string("unexpected reject: ") + error.what());
+    }
+    Require(threw, std::string("relocation was accepted: ") + text);
+}
+
+void RelocationBytes() {
+    constexpr std::uint64_t base = 0x60000000;
+    const std::uint64_t data = base + 0x1000;
+    std::vector<std::uint8_t> bytes(0x28);
+    const std::vector<ElfLoad> loads = {{base, 5, 2, {0x0f, 0x0b}}, {data, 6, bytes.size(), bytes}};
+    const std::vector<ElfSym> symbols = {{data + 0x20, 2, 0x10}, {0, 0, 0x20}};
+    const std::vector<ElfRel> relocs = {
+        {data, 10, 1, 0},
+        {data + 4, 11, 1, 0},
+        {data + 8, 24, 1, 0},
+        {data + 16, 6, 1, 0},
+        {data + 24, 1, 2, 0},
+        {data + 32, 1, 1, 8},
+    };
+    const auto plan = Relinker::Wasm::PlanWasmImage(MakeElf(base, 2, loads, symbols, relocs, false));
+    const auto& segment = plan.Segments[1];
+    ExpectEqual("R_X86_64_32", Read32(segment.Bytes.data()), static_cast<std::uint32_t>(data + 0x20));
+    ExpectEqual("R_X86_64_32S", Read32(segment.Bytes.data() + 4), static_cast<std::uint32_t>(data + 0x20));
+    ExpectEqual("R_X86_64_PC64", Read64(segment.Bytes.data() + 8), 0x18);
+    ExpectEqual("R_X86_64_GLOB_DAT", Read64(segment.Bytes.data() + 16), data + 0x20);
+    ExpectEqual("weak undefined", Read64(segment.Bytes.data() + 24), 0);
+    ExpectEqual("R_X86_64_64 addend", Read64(segment.Bytes.data() + 32), data + 0x28);
+    std::vector<std::uint8_t> dyn(96);
+    const std::uint64_t slot = data;
+    const std::uint64_t rela = data + 8;
+    const std::uint64_t dynamic = data + 32;
+    const std::uint64_t addend = 0x123456789abcdef0ull;
+    Put(dyn, 8, slot, 8);
+    Put(dyn, 16, 8, 8);
+    Put(dyn, 24, addend, 8);
+    Put(dyn, 32, 7, 8);
+    Put(dyn, 40, rela, 8);
+    Put(dyn, 48, 8, 8);
+    Put(dyn, 56, 24, 8);
+    Put(dyn, 64, 9, 8);
+    Put(dyn, 72, 24, 8);
+    std::vector<std::uint8_t> code = {0x0f, 0x0b};
+    const std::size_t phOff = 64;
+    const std::size_t codeAt = phOff + 56 * 3;
+    const std::size_t dataAt = codeAt + code.size();
+    std::vector<std::uint8_t> dynamicElf(dataAt + dyn.size());
+    dynamicElf[0] = 0x7f;
+    dynamicElf[1] = 'E';
+    dynamicElf[2] = 'L';
+    dynamicElf[3] = 'F';
+    dynamicElf[4] = 2;
+    dynamicElf[5] = 1;
+    dynamicElf[6] = 1;
+    Put(dynamicElf, 16, 3, 2);
+    Put(dynamicElf, 18, 62, 2);
+    Put(dynamicElf, 20, 1, 4);
+    Put(dynamicElf, 24, base, 8);
+    Put(dynamicElf, 32, phOff, 8);
+    Put(dynamicElf, 52, 64, 2);
+    Put(dynamicElf, 54, 56, 2);
+    Put(dynamicElf, 56, 3, 2);
+    auto phdr = [&](std::size_t index, std::uint32_t type, std::uint32_t flags, std::uint64_t offset, std::uint64_t address, std::uint64_t filesz, std::uint64_t memsz) {
+        const auto header = phOff + index * 56;
+        Put(dynamicElf, header, type, 4);
+        Put(dynamicElf, header + 4, flags, 4);
+        Put(dynamicElf, header + 8, offset, 8);
+        Put(dynamicElf, header + 16, address, 8);
+        Put(dynamicElf, header + 24, address, 8);
+        Put(dynamicElf, header + 32, filesz, 8);
+        Put(dynamicElf, header + 40, memsz, 8);
+        Put(dynamicElf, header + 48, 0x1000, 8);
+    };
+    phdr(0, 1, 5, codeAt, base, code.size(), code.size());
+    phdr(1, 1, 6, dataAt, data, dyn.size(), dyn.size());
+    phdr(2, 2, 6, dataAt + 32, dynamic, 64, 64);
+    std::memcpy(dynamicElf.data() + codeAt, code.data(), code.size());
+    std::memcpy(dynamicElf.data() + dataAt, dyn.data(), dyn.size());
+    const auto dynamicPlan = Relinker::Wasm::PlanWasmImage(dynamicElf);
+    ExpectEqual("R_X86_64_RELATIVE", Read64(dynamicPlan.Segments[1].Bytes.data()), addend);
+}
+
+void RelocationRejects() {
+    constexpr std::uint64_t base = 0x200000;
+    const auto loads = BaseLoads(base);
+    const ElfSym defined{base + 0x1000, 2, 0x10};
+    const ElfSym absolute{0x100000000ull, 0xfff1, 0x10};
+    const ElfSym far{base + 0x1000 + 0x80000000ull, 0xfff1, 0x10};
+    Throws(MakeElf(base, 2, loads, {{0, 0, 0x10}}, {{base + 0x1000, 1, 1, 0}}, false), "undefined");
+    Throws(MakeElf(base, 2, loads, {defined}, {{base + 0x1000, 18, 1, 0}}, false), "TLS");
+    Throws(MakeElf(base, 2, loads, {absolute}, {{base + 0x1000, 10, 1, 0}}, false), "overflow");
+    Throws(MakeElf(base, 2, loads, {defined}, {{base + 0x1000, 1, 1, 0}, {base + 0x1000, 1, 1, 0}}, false), "overlapping");
+    Throws(MakeElf(base, 2, loads, {defined}, {{0x10, 1, 1, 0}}, false), "outside");
+    Throws(MakeElf(base, 2, loads, {defined}, {{base + 0x1000, 1, 1, 0}}, true), "REL relocations");
+    Throws(MakeElf(base, 2, loads, {defined}, {{base + 0x1000, 6, 1, 5}}, false), "nonzero");
+    Throws(MakeElf(base, 2, loads, {defined}, {{base + 0x1000, 12, 1, 0}}, false), "unsupported");
+    Throws(MakeElf(base, 2, loads, {far}, {{base + 0x1000, 2, 1, 0}}, false), "overflow");
+}
+
+void Flags() {
+    constexpr std::uint64_t base = 0x200000;
+    Asm code;
+    auto movEax = [&](std::uint32_t value) { code.B({0xb8}); code.U32(value); };
+    auto pushf = [&] { code.B({0x9c}); };
+    movEax(0);
+    code.B({0x83, 0xc0, 0x01});
+    pushf();
+    movEax(0);
+    code.B({0x05});
+    code.U32(0xffffffffu);
+    pushf();
+    movEax(0x7fffffff);
+    code.B({0x83, 0xc0, 0x01});
+    pushf();
+    movEax(0);
+    code.B({0x83, 0xe8, 0x01});
+    pushf();
+    movEax(5);
+    code.B({0x83, 0xf8, 0x05});
+    pushf();
+    movEax(1);
+    code.B({0xff, 0xc8});
+    pushf();
+    movEax(0);
+    code.B({0x83, 0xe8, 0x01});
+    code.B({0xff, 0xc0});
+    pushf();
+    movEax(0x0f);
+    code.B({0x21, 0xc0});
+    pushf();
+    movEax(0);
+    code.B({0x85, 0xc0});
+    pushf();
+    code.B({0x48, 0xb8});
+    code.U64(0x8000000000000000ull);
+    code.B({0x48, 0x01, 0xc0});
+    pushf();
+    code.B({0xbb});
+    code.U32(static_cast<std::uint32_t>(base + 0x200));
+    code.B({0xc7, 0x03});
+    code.U32(5);
+    movEax(3);
+    code.B({0x03, 0x03});
+    pushf();
+    const auto ud2 = base + code.Bytes.size();
+    code.B({0x0f, 0x0b});
+    auto image = code.Bytes;
+    image.resize(0x210);
+    const auto run = RunGuest(Elf(base, base, image));
+    Require(run.Native.Signal == SIGILL, "flags signal " + std::to_string(run.Native.Signal));
+    ExpectEqual("flags status", run.Status, 0);
+    ExpectEqual("flags rip", run.Rip, ud2);
+    ExpectEqual("native flags rip", run.Native.Rip, ud2);
+    for (int reg = 0; reg < 16; ++reg) ExpectEqual("flags gpr " + std::to_string(reg), run.Gpr[reg], run.Native.Gpr[reg]);
+    ExpectEqual("flags eax", run.Gpr[0], 8);
+    ExpectEqual("flags ebx", run.Gpr[3], base + 0x200);
+    ExpectEqual("flags rsp", run.Gpr[4], run.Plan.StackTop - 11 * 8);
+    ExpectFlags("flags register", run.Native.Flags, run.Flags, false);
+    const std::uint64_t expect[] = {0x202, 0x286, 0xa96, 0x297, 0x246, 0x246, 0x257, 0x206, 0x246, 0xa47, 0x202};
+    const bool logical[] = {false, false, false, false, false, false, false, true, true, false, false};
+    for (int index = 0; index < 11; ++index) {
+        const auto address = run.Plan.StackTop - static_cast<std::uint64_t>(index + 1) * 8;
+        const auto native = At(run.NativeMemory, run.Plan.GuestBase, address);
+        const auto wasm = At(run.WasmMemory, run.Plan.GuestBase, address);
+        ExpectFlags("pushed flags " + std::to_string(index), native, wasm, logical[index]);
+        ExpectEqual("native pushed flags " + std::to_string(index), native & (logical[index] ? kLogicalMask : kFlagMask), expect[index]);
+    }
+    ExpectEqual("native five", Read32(run.NativeMemory.data() + 0x200), 5);
+    ExpectEqual("wasm five", Read32(run.WasmMemory.data() + 0x200), 5);
+}
+
+void GuestMemory() {
+    constexpr std::uint64_t codeVA = 0x100000000ull;
+    constexpr std::uint64_t dataVA = 0x100001000ull;
+    constexpr std::uint64_t hole = 0x100001040ull;
+    Asm code;
+    code.B({0xe8});
+    const auto callAt = code.Bytes.size();
+    code.U32(0);
+    code.B({0x49, 0x89, 0xc6});
+    code.B({0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x20, 0x48, 0xb8});
+    code.U64(0xaabbccddeeff0011ull);
+    code.B({0x48, 0x89, 0x45, 0xf8, 0x48, 0x8b, 0x5d, 0xf8, 0x48, 0x89, 0xec, 0x5d});
+    code.B({0x48, 0xbf});
+    code.U64(dataVA);
+    code.B({0x48, 0x8b, 0x07, 0x48, 0x8b, 0x08, 0x48, 0x8d, 0x50, 0x18});
+    code.B({0x48, 0xbe});
+    code.U64(0x99);
+    code.B({0x48, 0x89, 0x32, 0x48, 0x83, 0xc0, 0x20, 0x4c, 0x8b, 0x00});
+    code.B({0x41, 0xba});
+    code.U32(2);
+    code.B({0x4e, 0x8d, 0x3c, 0xd7});
+    code.B({0x49, 0xb9});
+    code.U64(hole);
+    code.B({0x49, 0xba});
+    code.U64(0x0807060504030201ull);
+    code.B({0x4d, 0x89, 0x11});
+    code.B({0x49, 0xbb});
+    code.U64(dataVA + 0x18);
+    code.B({0x48, 0xb8});
+    code.U64(~std::uint64_t{0});
+    code.B({0x49, 0x89, 0x03, 0x41, 0xc7, 0x03});
+    code.U32(0x12345678);
+    code.B({0x41, 0x8b, 0x03, 0x4d, 0x8b, 0x23, 0x4c, 0x8d, 0x2d});
+    const auto leaAt = code.Bytes.size();
+    code.U32(0);
+    const auto ud2 = codeVA + code.Bytes.size();
+    code.B({0x0f, 0x0b});
+    const auto func = codeVA + code.Bytes.size();
+    code.B({0xb8});
+    code.U32(0x2a);
+    code.B({0xc3});
+    std::vector<std::uint8_t> data(0x30);
+    const std::uint64_t literal = 0x1122334455667788ull;
+    Put(data, 0x10, literal, 8);
+    const std::vector<ElfLoad> loads = {{codeVA, 5, code.Bytes.size(), code.Bytes}, {dataVA, 6, 0x38, data}};
+    const std::vector<ElfSym> symbols = {{dataVA + 0x10, 2, 0x10}, {func, 1, 0x10}};
+    const std::vector<ElfRel> relocs = {
+        {dataVA, 1, 1, 0},
+        {dataVA + 8, 8, 0, static_cast<std::int64_t>(dataVA + 0x10)},
+        {codeVA + callAt, 4, 2, -4},
+        {codeVA + leaAt, 2, 1, -4},
+    };
+    const auto run = RunGuest(MakeElf(codeVA, 2, loads, symbols, relocs, false));
+    Require(run.Native.Signal == SIGILL, "memory signal " + std::to_string(run.Native.Signal));
+    ExpectEqual("memory status", run.Status, 0);
+    ExpectEqual("memory rip", run.Rip, ud2);
+    ExpectEqual("native memory rip", run.Native.Rip, ud2);
+    ExpectSameMemory(run);
+    const std::uint64_t expect[16] = {0x12345678, literal, dataVA + 0x28, 0xaabbccddeeff0011ull, run.Plan.StackTop, 0, 0x99, dataVA, 0, hole, 0x0807060504030201ull, dataVA + 0x18, 0xffffffff12345678ull, dataVA + 0x10, 0x2a, dataVA + 0x10};
+    for (int reg = 0; reg < 16; ++reg) {
+        ExpectEqual("native gpr " + std::to_string(reg), run.Native.Gpr[reg], expect[reg]);
+        ExpectEqual("wasm gpr " + std::to_string(reg), run.Gpr[reg], expect[reg]);
+    }
+    ExpectEqual("native rcx value", run.Native.Gpr[1], literal);
+    ExpectEqual("relocated pointer", At(run.WasmMemory, run.Plan.GuestBase, dataVA), dataVA + 0x10);
+    ExpectEqual("relative pointer", At(run.WasmMemory, run.Plan.GuestBase, dataVA + 8), dataVA + 0x10);
+    ExpectEqual("frame slot", At(run.WasmMemory, run.Plan.GuestBase, run.Plan.StackTop - 16), 0xaabbccddeeff0011ull);
+    ExpectEqual("bss", At(run.WasmMemory, run.Plan.GuestBase, dataVA + 0x30), 0);
+    ExpectFlags("memory flags", run.Native.Flags, run.Flags, false);
+}
+
+void Fault() {
+    constexpr std::uint64_t base = 0x50000000;
+    Asm code;
+    code.B({0xb8});
+    code.U32(1);
+    code.B({0x48, 0xc7, 0xc3, 0x00, 0x00, 0x00, 0x00});
+    const auto at = base + code.Bytes.size();
+    code.B({0x48, 0x8b, 0x0b, 0x0f, 0x0b});
+    const auto run = RunGuest(Elf(base, base, code.Bytes));
+    Require(run.Native.Signal == SIGSEGV, "fault signal " + std::to_string(run.Native.Signal));
+    ExpectEqual("fault status", run.Status, 2);
+    ExpectEqual("fault rax", run.Native.Gpr[0], 1);
+    ExpectEqual("wasm fault rax", run.Gpr[0], 1);
+    ExpectEqual("fault rbx", run.Gpr[3], 0);
+    ExpectEqual("fault rcx", run.Gpr[2], 0);
+    ExpectEqual("fault rip", run.Rip, at);
+    ExpectEqual("native fault rip", run.Native.Rip, at);
+    ExpectFlags("fault flags", run.Native.Flags, run.Flags, false);
+    ExpectSameMemory(run);
+}
+
 }
 
 int main() {
     try {
+        ArmSignals();
         Unsupported();
         Milestone();
+        RelocationBytes();
+        RelocationRejects();
+        Flags();
+        GuestMemory();
+        Fault();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

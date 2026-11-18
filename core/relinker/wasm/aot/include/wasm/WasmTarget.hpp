@@ -6,6 +6,7 @@
 
 namespace Relinker::Wasm {
 
+inline constexpr std::uint64_t kWasmGuestBase = 0;
 inline constexpr std::uint64_t kStateAddress = 0xF0000;
 inline constexpr std::uint64_t kGprBytes = 16 * 8;
 inline constexpr std::uint64_t kRipOffset = kGprBytes;
@@ -22,6 +23,9 @@ inline constexpr int kRsp = 4;
 struct WasmSegment {
     std::uint64_t Virtual = 0;
     std::uint64_t MemorySize = 0;
+    std::uint64_t FileSize = 0;
+    std::uint64_t FileOffset = 0;
+    std::uint64_t ContentSize = 0;
     std::uint32_t Flags = 0;
     std::vector<std::uint8_t> Bytes;
 };
@@ -36,6 +40,7 @@ struct WasmImage {
 };
 
 [[nodiscard]] WasmImage PlanWasmImage(const std::vector<std::uint8_t>& elf);
+void ApplyWasmRelocations(const std::vector<std::uint8_t>& elf, WasmImage& image);
 [[nodiscard]] std::vector<std::uint8_t> CompileWasm(const std::vector<std::uint8_t>& elf);
 
 }

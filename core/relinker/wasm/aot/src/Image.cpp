@@ -65,17 +65,21 @@ WasmImage PlanWasmImage(const std::vector<std::uint8_t>& elf) {
         const auto fileSize = Read64(elf, header + 32);
         const auto memorySize = Read64(elf, header + 40);
         if (fileSize > memorySize) Fail("wasm: PT_LOAD file size exceeds memory size");
+        if (memorySize > kStateAddress) Fail("wasm: load segment does not fit in the WebAssembly guest window");
         if (memorySize > 0 && virtualAddress + memorySize < virtualAddress) Fail("wasm: PT_LOAD address wraps");
         if (offset > elf.size() || fileSize > elf.size() - offset) Fail("wasm: PT_LOAD is outside the file");
-        if (virtualAddress + memorySize > kStateAddress) Fail("wasm: load segment does not fit below the CPU state page");
         for (const auto& existing : image.Segments) {
             if (Overlaps(existing.Virtual, existing.MemorySize, virtualAddress, memorySize)) Fail("wasm: overlapping PT_LOAD segments");
         }
         WasmSegment segment;
         segment.Virtual = virtualAddress;
         segment.MemorySize = memorySize;
+        segment.FileSize = fileSize;
+        segment.FileOffset = offset;
         segment.Flags = flags;
         segment.Bytes.assign(elf.begin() + static_cast<std::ptrdiff_t>(offset), elf.begin() + static_cast<std::ptrdiff_t>(offset + fileSize));
+        segment.Bytes.resize(static_cast<std::size_t>(memorySize));
+        segment.ContentSize = fileSize;
         if ((flags & 1u) != 0 && entry >= virtualAddress && entry < virtualAddress + fileSize) sawEntry = true;
         image.Segments.push_back(std::move(segment));
     }
@@ -92,11 +96,12 @@ WasmImage PlanWasmImage(const std::vector<std::uint8_t>& elf) {
     const auto stackBase = (end + 0xfff) & ~std::uint64_t{0xfff};
     if (stackBase < end) Fail("wasm: stack address wraps");
     const auto stackTop = stackBase + kStackBytes;
-    if (stackTop < stackBase || stackTop > kStateAddress) Fail("wasm: guest image and stack do not fit below the CPU state page");
+    if (stackTop < stackBase || lowest > stackTop || stackTop - lowest > kStateAddress) Fail("wasm: guest image and stack do not fit in the WebAssembly guest window");
     image.GuestBase = lowest;
     image.StackBase = stackBase;
     image.StackTop = stackTop;
     image.GuestLimit = stackTop;
+    ApplyWasmRelocations(elf, image);
     return image;
 }
 
