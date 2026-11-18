@@ -6,6 +6,7 @@
 #include <wasm/WasmTarget.hpp>
 #include <domain/Types.hpp>
 #include <nid/NidCompute.hpp>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -1402,6 +1403,100 @@ void ExpectPixels(const std::string& out, const std::string& rgba) {
     Require(out.find("err none") != std::string::npos, out);
 }
 
+void SecondFrame() {
+    constexpr std::uint64_t codeVA = 0x10000;
+    constexpr std::uint64_t dataVA = 0x11000;
+    constexpr std::uint64_t pixel = dataVA;
+    constexpr std::uint64_t command = dataVA + 0x10;
+    constexpr std::uint64_t got = dataVA + 0x28;
+    constexpr std::uint32_t kFillIters = 4500000;
+    const auto progress = std::fmod(1.f / 60.f, 1.f);
+    const auto green = static_cast<std::uint8_t>(255.f * progress * 5.f);
+    Require(green == 21, "second frame green");
+    Require(static_cast<std::uint64_t>(kFillIters) * 2 > 8000000, "fill stays under the old step limit");
+    Require(static_cast<std::uint64_t>(kFillIters) * 2 < Relinker::Wasm::kStepLimit, "fill exceeds the step limit");
+    const std::uint32_t second = 0xffu | (static_cast<std::uint32_t>(green) << 8) | (0xffu << 24);
+    Asm code;
+    auto movabs = [&](std::uint8_t reg, std::uint64_t value) {
+        code.B({static_cast<std::uint8_t>(reg < 8 ? 0x48 : 0x49), static_cast<std::uint8_t>(0xb8 + (reg & 7))});
+        code.U64(value);
+    };
+    auto storePixel = [&](std::uint32_t rgba) {
+        movabs(0, pixel);
+        code.B({0xc7, 0x00});
+        code.U32(rgba);
+    };
+    auto submit = [&]() {
+        movabs(7, command);
+        movabs(6, 20);
+        code.B({0xff, 0x15});
+        const auto next = codeVA + code.Bytes.size() + 4;
+        code.U32(static_cast<std::uint32_t>(static_cast<std::int64_t>(got) - static_cast<std::int64_t>(next)));
+    };
+    storePixel(0xff0000ffu);
+    submit();
+    code.B({0xb9});
+    code.U32(kFillIters);
+    const auto head = code.Bytes.size();
+    code.B({0x83, 0xf9, 0x00, 0x74, 0x00});
+    const auto jeAt = code.Bytes.size() - 1;
+    code.B({0xff, 0xc9, 0xeb, 0x00});
+    const auto jmpAt = code.Bytes.size() - 1;
+    const auto done = code.Bytes.size();
+    code.Bytes[jeAt] = static_cast<std::uint8_t>(done - (jeAt + 1));
+    code.Bytes[jmpAt] = static_cast<std::uint8_t>(static_cast<int>(head) - static_cast<int>(jmpAt + 1));
+    storePixel(second);
+    submit();
+    code.B({0x0f, 0x0b});
+    std::vector<std::uint8_t> data(0x30);
+    Put(data, 0x10, 3, 4);
+    Put(data, 0x14, 1, 4);
+    Put(data, 0x18, 1, 4);
+    Put(data, 0x1c, pixel - codeVA, 4);
+    Put(data, 0x20, 4, 4);
+    const auto elf = DynamicElf(codeVA, code.Bytes, dataVA, data, {"libSceLibcInternal.sprx"}, {{"anyps5_webgpu_submit", got}});
+    const auto plan = Relinker::Wasm::PlanWasmImage(elf);
+    Require(plan.GuestBase == codeVA, "second frame guest base");
+    const auto directory = std::filesystem::temp_directory_path() / ("anyps5-wasm-second-frame-" + std::to_string(getpid()));
+    std::filesystem::create_directories(directory);
+    const auto input = directory / "guest.elf";
+    const auto output = directory / "guest.wasm";
+    const auto script = directory / "run.js";
+    {
+        std::ofstream elfFile(input, std::ios::binary);
+        elfFile.write(reinterpret_cast<const char*>(elf.data()), static_cast<std::streamsize>(elf.size()));
+        std::ofstream scriptFile(script);
+        scriptFile << R"(const fs = require('fs');
+const bytes = fs.readFileSync(process.argv[2]);
+const slot = { memory: null, pixels: [] };
+const imports = { env: { anyps5_webgpu_submit(ptr, len) {
+  const view = new DataView(slot.memory.buffer, ptr, len);
+  const opcode = view.getUint32(0, true);
+  const offset = view.getUint32(12, true);
+  const pixel = new Uint8Array(slot.memory.buffer, offset, 4);
+  slot.pixels.push(opcode + ':' + Array.from(pixel).join(','));
+  return 0;
+}}};
+const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), imports);
+slot.memory = instance.exports.memory;
+const status = instance.exports.anyps5_run();
+process.stdout.write(String(status) + '\n' + slot.pixels.join(' ') + '\n');
+)";
+    }
+    const auto linked = Run({ANYPS5_RELINKER, "--wasm", input.string(), output.string()});
+    Require(linked.Status == 0, "second frame link failed: " + linked.Err + linked.Out);
+    const auto node = Run({ANYPS5_NODE, "--liftoff-only", script.string(), output.string()});
+    std::filesystem::remove_all(directory);
+    Require(node.Status == 0, "second frame host failed: " + node.Err + node.Out);
+    std::istringstream lines(node.Out);
+    std::string statusText, pixels;
+    Require(static_cast<bool>(std::getline(lines, statusText) && std::getline(lines, pixels)), "second frame dump is incomplete: " + node.Out);
+    ExpectEqual("second frame status", static_cast<std::uint64_t>(std::stoll(statusText)), 0);
+    const std::string first = "3:255,0,0,255";
+    const std::string next = "3:255," + std::to_string(green) + ",0,255";
+    Require(pixels == first + " " + next, "second frame pixels " + pixels);
+}
+
 void WebGpu() {
     const auto checked = Run({ANYPS5_NODE, ANYPS5_WEBGPU_RUN, "check"});
     Require(checked.Status == 0 && checked.Out.find("ok") != std::string::npos, "shader check failed: " + checked.Err + checked.Out);
@@ -1572,6 +1667,7 @@ int main() {
         Fault();
         Optimized();
         Imports();
+        SecondFrame();
         WebGpu();
         Forms();
     } catch (const std::exception& error) {

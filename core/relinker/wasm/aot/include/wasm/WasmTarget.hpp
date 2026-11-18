@@ -28,7 +28,7 @@ inline constexpr std::uint64_t kHostQueue = 160;
 inline constexpr std::uint64_t kDirectBudget = 0x40000000;
 inline constexpr std::uint64_t kStackBytes = 0x10000;
 inline constexpr std::uint64_t kInitialFlags = 0x202;
-inline constexpr std::uint32_t kStepLimit = 8000000;
+inline constexpr std::uint32_t kStepLimit = 16000000;
 inline constexpr int kRsp = 4;
 
 struct WasmSegment {
