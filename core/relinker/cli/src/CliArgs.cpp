@@ -14,10 +14,12 @@ namespace Cli {
 
 const char* Usage() {
     return "Usage: relinker [options] <input.elf> <output>\n"
+           "       relinker --wasm <input.elf> <output.wasm>\n"
            "       relinker --verify-patches <file> [--verify-output] [options] <path>\n"
            "\n"
            "Output:\n"
            "  --windows                      Produce a Windows PE executable.\n"
+           "  --wasm                         Lift a freestanding x86-64 ELF to a WebAssembly module.\n"
            "  --macos                        Produce an x86-64 Mach-O executable; bundled modules become Mach-O libraries.\n"
            "  --windows-diagnostics          Include startup dependency diagnostics. Requires --windows.\n"
            "  --windows-gui                  Select the Windows GUI subsystem. Requires --windows.\n"
@@ -72,7 +74,7 @@ const char* Usage() {
 namespace {
 
 constexpr std::string_view kVerifyRejectedOptions[] = {
-    "--dry-run",
+    "--dry-run", "--wasm",
     "--windows", "--macos", "--windows-gui", "--windows-diagnostics", "--windows-fixed-base", "--trace-imports", "--linux-fixed-base", "--macos-fixed-base",
     "--to-intel", "--to-rosetta", "--to-avx", "--frame-red-zone", "--skip-syscall-check", "--trap-sdk-syscall-stubs", "--function-symbol-roots", "unused-filter=",
     "--rpath", "--registry", "--omit-unavailable-dependencies", "--lazy-binding", "--autorun", "--patches", "--no-patches",
@@ -204,6 +206,8 @@ Args ParseArgs(int argc, char* argv[]) {
                 throw std::runtime_error("--rpath requires a value");
             args.runPath = argv[++i];
             runPathSpecified = true;
+        } else if (arg == "--wasm") {
+            args.toWasm = true;
         } else if (arg == "--windows") {
             args.toWindows = true;
         } else if (arg == "--macos") {
@@ -256,6 +260,14 @@ Args ParseArgs(int argc, char* argv[]) {
     if (args.skipSceModule && !args.executables.empty())
         throw std::runtime_error("--executable conflicts with --skip-sce-module");
 
+    if (args.toWasm && (args.toWindows || args.toMacos || args.toIntel || args.toRosetta || args.toAvx || args.frameRedZone ||
+        args.writeRegistry || args.lazyBinding || args.omitUnavailableDependencies || args.autorun || args.dryRun ||
+        args.windowsDiagnostics || args.windowsGui || args.traceImports || args.skipSyscallCheck || args.trapSdkSyscallStubs ||
+        args.functionSymbolRoots || args.skipSceModule || args.noPatches || !args.patchesPath.empty() || verifying ||
+        args.verifyOutput || args.windowsFixedBase || args.linuxFixedBase || args.macosFixedBase || args.unusedFilterLevel != 0 ||
+        !args.excludedSceModules.empty() || !args.moduleDirectories.empty() || !args.executables.empty() ||
+        args.runPath != "$ORIGIN/libs" || sceModulePathSpecified))
+        throw std::runtime_error("--wasm cannot be combined with other options");
     if (args.toWindows && args.toMacos)
         throw std::runtime_error("--windows conflicts with --macos");
     if (args.toRosetta && args.toWindows)
@@ -287,7 +299,7 @@ Args ParseArgs(int argc, char* argv[]) {
         throw std::runtime_error(Usage());
 
 
-    if (!sceModulePathSpecified && !args.skipSceModule && !args.inputPath.empty() && !args.verifyOutput) args.sceModulePath = Io::Utf8Path(std::filesystem::absolute(Io::NativePath(args.inputPath)).parent_path());
+    if (!args.toWasm && !sceModulePathSpecified && !args.skipSceModule && !args.inputPath.empty() && !args.verifyOutput) args.sceModulePath = Io::Utf8Path(std::filesystem::absolute(Io::NativePath(args.inputPath)).parent_path());
 
     return args;
 }

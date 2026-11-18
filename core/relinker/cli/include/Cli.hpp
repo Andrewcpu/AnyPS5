@@ -22,6 +22,7 @@ struct Args {
     bool frameRedZone = false;
     bool writeRegistry = false;
     bool toWindows = false;
+    bool toWasm = false;
     bool toMacos = false;
     bool lazyBinding = false;
     bool omitUnavailableDependencies = false;

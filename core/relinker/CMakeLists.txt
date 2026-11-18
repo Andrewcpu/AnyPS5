@@ -226,6 +226,19 @@ if(NOT ANYPS5_RELINKER_CLI)
     return()
 endif()
 
+add_library(relinker_wasm_aot STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Image.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Decode.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Discover.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Lift.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/Codegen.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/src/WasmTarget.cpp)
+target_include_directories(relinker_wasm_aot PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/domain/include)
+target_compile_features(relinker_wasm_aot PUBLIC cxx_std_20)
+set_target_properties(relinker_wasm_aot PROPERTIES CXX_EXTENSIONS OFF)
+
 add_executable(relinker
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/CliArgs.cpp
@@ -235,8 +248,39 @@ add_executable(relinker
     ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileReader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileWriter.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/NativeModules.cpp)
-target_link_libraries(relinker PRIVATE relinker_core)
+target_link_libraries(relinker PRIVATE relinker_core relinker_wasm_aot)
 target_include_directories(relinker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli/include ${CMAKE_CURRENT_SOURCE_DIR}/../libs)
+
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    set(anyps5WasmProbe ${CMAKE_CURRENT_BINARY_DIR}/wasm_probe)
+    file(WRITE ${anyps5WasmProbe}.ll "target triple = \"wasm32\"\ndefine i32 @anyps5_run() { ret i32 0 }\n")
+    execute_process(
+        COMMAND bash -c [=[
+set -euo pipefail
+clang_bin=$(command -v clang || command -v clang-18)
+ld_bin=$(command -v wasm-ld || command -v wasm-ld-18)
+node_bin=$(command -v node)
+"$clang_bin" --target=wasm32 -O0 -c -o "$0.o" "$0.ll"
+"$ld_bin" --no-entry --export=anyps5_run -o "$0.wasm" "$0.o"
+"$node_bin" -e 'const fs=require("fs"); WebAssembly.compile(fs.readFileSync(process.argv[1])).then(()=>process.exit(0),()=>process.exit(1));' "$0.wasm"
+printf '%s' "$node_bin"
+]=] ${anyps5WasmProbe}
+        RESULT_VARIABLE anyps5WasmProbeResult
+        OUTPUT_VARIABLE ANYPS5_NODE
+        ERROR_VARIABLE anyps5WasmProbeError)
+    if(anyps5WasmProbeResult EQUAL 0)
+        add_test_executable(wasm_lift_tests ${CMAKE_CURRENT_SOURCE_DIR}/wasm/aot/tests/WasmLiftTests.cpp)
+        target_link_libraries(wasm_lift_tests PRIVATE relinker_wasm_aot)
+        target_compile_features(wasm_lift_tests PRIVATE cxx_std_20)
+        set_target_properties(wasm_lift_tests PROPERTIES CXX_EXTENSIONS OFF)
+        target_compile_definitions(wasm_lift_tests PRIVATE ANYPS5_RELINKER="$<TARGET_FILE:relinker>" ANYPS5_NODE="${ANYPS5_NODE}")
+        add_dependencies(wasm_lift_tests relinker)
+        add_test(NAME wasm_lift COMMAND wasm_lift_tests)
+        set_tests_properties(wasm_lift PROPERTIES TIMEOUT 30)
+    else()
+        message(STATUS "WebAssembly lift test skipped")
+    endif()
+endif()
 set_target_properties(relinker PROPERTIES CXX_EXTENSIONS OFF)
 
 find_package(Git QUIET)

@@ -1,0 +1,6 @@
+# relinker
+
+## add Functional
+
+- The [WebAssembly lifter](../../../core/relinker/wasm/aot/src/Decode.cpp) does not vendor Remill. Remill's build find_packages a pinned LLVM and also glog, gflags and XED, so it is not a source-only 3rdparty submodule this tree can build with the relinker. Unimplemented opcodes throw. This pass lifts MOV, LEA, ADD, SUB, CMP, AND, OR, XOR, TEST, INC, DEC, PUSH, POP, JMP, Jcc, CALL, RET, MOVD, MOVQ, PXOR and NOP; HLT, UD2, INT3 and SYSCALL halt. 8-bit and 16-bit forms, address-size and segment prefixes, string ops, shifts, multiplies and indirect branches throw. Closes when: Remill is a submodule built from source.
+- The [WebAssembly backend](../../../core/relinker/wasm/aot/src/Codegen.cpp) writes LLVM IR and compiles it with clang --target=wasm32 -O0 and wasm-ld instead of linking LLVM. Guest addresses are wasm32 offsets. Loads and the 64 KiB stack must end at or below the CPU-state page at 0xF0000, and static data starts at 0x100000. Logical ALU clears AF, which Intel leaves undefined. The dispatch loop stops after one million steps. A halt leaves the resume flag clear; a Linux SIGILL frame sets it. There is no PS5 guest-memory map and no NID import. Closes when: codegen links LLVM's WebAssembly backend in-process.
