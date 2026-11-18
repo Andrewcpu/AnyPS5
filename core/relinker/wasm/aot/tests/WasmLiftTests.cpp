@@ -1131,7 +1131,7 @@ void Optimized() {
         ExpectEqual("milestone dispatch edges", CountText(ir, "br label %dispatch"), 1);
         ExpectEqual("milestone switches", CountText(ir, "switch i64"), 2);
         Require(ir.find("br label %g1005d") != std::string::npos, "milestone call was not direct");
-        Require(ir.find("i64 65555, label %g10013") != std::string::npos, "milestone return was not direct");
+        Require(ir.find("i64 65555, label %d10013") != std::string::npos, "milestone return was not direct");
     }
     {
         constexpr std::uint64_t base = 0x250000;

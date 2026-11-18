@@ -1010,6 +1010,15 @@ int ImportAt(const WasmImage& image, std::uint64_t address) {
 
 std::string BlockLabel(std::uint64_t address) { return "g" + Hex(address); }
 
+std::string DispatchLabel(std::uint64_t address) { return "d" + Hex(address); }
+
+void EmitTick(Ir& ir);
+
+void Enter(Ir& ir, std::uint64_t target, bool count) {
+    if (count) EmitTick(ir);
+    ir.Branch(BlockLabel(target));
+}
+
 struct FlagPlan {
     std::vector<std::vector<char>> Dead;
 };
@@ -1142,7 +1151,7 @@ void EmitEdge(Ir& ir, Locals& locals, const WasmImage& image, const WasmBlock& b
             EmitImport(ir, image, import, 0, false);
             return;
         }
-        if (known(target)) ir.Branch(BlockLabel(target));
+        if (known(target)) Enter(ir, target, block.EdgeKind == WasmBlock::Kind::Jump && target <= block.Edge);
         else {
             ir.StoreRip(ir.Const(target));
             ir.Branch("dispatch");
@@ -1153,8 +1162,20 @@ void EmitEdge(Ir& ir, Locals& locals, const WasmImage& image, const WasmBlock& b
         const auto cond = Condition(ir, block.Cc, locals.ReadFlags());
         locals.Spill();
         if (known(block.Target) && known(block.Fall)) {
-            if (block.Target == block.Fall) ir.Branch(BlockLabel(block.Target));
-            else ir.Line("br i1 " + cond + ", label %" + BlockLabel(block.Target) + ", label %" + BlockLabel(block.Fall));
+            const bool back = block.Target <= block.Edge;
+            if (!back || block.Target == block.Fall) {
+                if (back) EmitTick(ir);
+                if (block.Target == block.Fall) ir.Branch(BlockLabel(block.Target));
+                else ir.Line("br i1 " + cond + ", label %" + BlockLabel(block.Target) + ", label %" + BlockLabel(block.Fall));
+            } else {
+                const auto taken = ir.NextLabel("back");
+                const auto skipped = ir.NextLabel("fwd");
+                ir.Line("br i1 " + cond + ", label %" + taken + ", label %" + skipped);
+                ir.Label(taken);
+                Enter(ir, block.Target, true);
+                ir.Label(skipped);
+                ir.Branch(BlockLabel(block.Fall));
+            }
             return;
         }
         ir.StoreRip(ir.Select(cond, ir.Const(block.Target), ir.Const(block.Fall)));
@@ -1173,7 +1194,7 @@ void EmitEdge(Ir& ir, Locals& locals, const WasmImage& image, const WasmBlock& b
             return;
         }
         if (known(block.Target)) {
-            ir.Branch(BlockLabel(block.Target));
+            Enter(ir, block.Target, block.Target <= block.Edge);
             return;
         }
         ir.StoreRip(ir.Const(block.Target));
@@ -1204,7 +1225,7 @@ void EmitEdge(Ir& ir, Locals& locals, const WasmImage& image, const WasmBlock& b
     }
     const auto slow = ir.NextLabel("ret");
     ir.Text += "  switch i64 " + next + ", label %" + slow + " [\n";
-    for (const auto address : returns) ir.Text += "    i64 " + Number(address) + ", label %" + BlockLabel(address) + "\n";
+    for (const auto address : returns) ir.Text += "    i64 " + Number(address) + ", label %" + DispatchLabel(address) + "\n";
     ir.Text += "  ]\n";
     ir.Label(slow);
     ir.StoreRip(next);
@@ -1311,12 +1332,12 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
         ir.Line("store i64 " + now + ", ptr @anyps5_time_origin, align 8");
     }
     ir.Line("store i32 0, ptr @anyps5_steps, align 4");
-    if (BlockAt(blocks, image.Entry) >= 0) ir.Branch(BlockLabel(image.Entry));
+    if (BlockAt(blocks, image.Entry) >= 0) ir.Branch(DispatchLabel(image.Entry));
     else ir.Branch("dispatch");
     ir.Label("dispatch");
     const auto rip = ir.Load("i64", ir.StatePtr(kRipOffset));
     ir.Text += "  switch i64 " + rip + ", label %missing [\n";
-    for (const auto& block : blocks) ir.Text += "    i64 " + Number(block.Start) + ", label %" + BlockLabel(block.Start) + "\n";
+    for (const auto& block : blocks) ir.Text += "    i64 " + Number(block.Start) + ", label %" + DispatchLabel(block.Start) + "\n";
     for (std::size_t index = 0; index < image.Imports.size(); ++index) ir.Text += "    i64 " + Number(image.Imports[index].Entry) + ", label %i" + std::to_string(index) + "\n";
     ir.Text += "  ]\n";
     const auto flags = BuildFlagPlan(image, blocks);
@@ -1324,12 +1345,16 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
     for (int index = 0; index < static_cast<int>(blocks.size()); ++index) {
         const auto& block = blocks[static_cast<std::size_t>(index)];
         ir.Label(BlockLabel(block.Start));
-        EmitTick(ir);
         Locals locals(ir);
         for (std::size_t insn = 0; insn < block.Insns.size(); ++insn) {
             EmitInsn(ir, locals, block.Insns[insn], flags.Dead[static_cast<std::size_t>(index)][insn] != 0);
         }
         EmitEdge(ir, locals, image, block, blocks, returns);
+    }
+    for (const auto& block : blocks) {
+        ir.Label(DispatchLabel(block.Start));
+        EmitTick(ir);
+        ir.Branch(BlockLabel(block.Start));
     }
     for (std::size_t index = 0; index < image.Imports.size(); ++index) {
         ir.Label("i" + std::to_string(index));
