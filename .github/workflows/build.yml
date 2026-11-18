@@ -155,7 +155,7 @@ jobs:
             const relinkerHosts = (full, linux, intelMac = true) => JSON.stringify([
               ...(full && linux ? [] : [{ os: 'ubuntu-latest', compiler: 'g++' }]),
               ...(full ? [] : [{ os: 'windows-latest', compiler: 'g++' }]),
-              { os: 'macos-latest', compiler: 'clang++' },
+              { os: 'macos-15-intel', compiler: 'clang++' },
               ...(intelMac ? [{ os: 'macos-latest', compiler: 'clang++', architectures: 'x86_64' }] : []),
             ]);
             if (context.eventName === 'push') {
