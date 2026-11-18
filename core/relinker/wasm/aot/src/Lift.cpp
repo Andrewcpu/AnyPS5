@@ -213,21 +213,66 @@ public:
 
     void Branch(const std::string& target) { Line("br label %" + target); }
 
+    std::string NextLabel(const char* prefix) { return std::string(prefix) + std::to_string(label++); }
+
 private:
     int temp = 0;
     int label = 0;
 };
 
-std::string AddressOf(Ir& ir, const WasmInsn& insn, const WasmOperand& memory) {
+class Locals {
+public:
+    explicit Locals(Ir& ir) : ir(ir) {}
+
+    std::string Read(int reg) {
+        if (gpr[reg].empty()) gpr[reg] = ir.LoadGpr(reg);
+        return gpr[reg];
+    }
+
+    void Write(int reg, const std::string& value) {
+        gpr[reg] = value;
+        dirty[reg] = true;
+    }
+
+    std::string ReadFlags() {
+        if (flags.empty()) flags = ir.LoadFlags();
+        return flags;
+    }
+
+    void WriteFlags(const std::string& value) {
+        flags = value;
+        flagsDirty = true;
+    }
+
+    void Spill() {
+        for (int reg = 0; reg < 16; ++reg) {
+            if (!dirty[reg]) continue;
+            ir.StoreGpr(reg, gpr[reg]);
+            dirty[reg] = false;
+        }
+        if (!flagsDirty) return;
+        ir.StoreFlags(flags);
+        flagsDirty = false;
+    }
+
+private:
+    Ir& ir;
+    std::string gpr[16];
+    bool dirty[16]{};
+    std::string flags;
+    bool flagsDirty = false;
+};
+
+std::string AddressOf(Ir& ir, Locals& locals, const WasmInsn& insn, const WasmOperand& memory) {
     if (memory.Rip) return ir.Const(insn.Next + static_cast<std::uint64_t>(memory.Disp));
     std::string address;
     bool any = false;
     if (memory.Base >= 0) {
-        address = ir.LoadGpr(memory.Base);
+        address = locals.Read(memory.Base);
         any = true;
     }
     if (memory.Index >= 0) {
-        auto index = ir.LoadGpr(memory.Index);
+        auto index = locals.Read(memory.Index);
         const auto shift = ScaleShift(memory.Scale);
         if (shift != 0) index = ir.Shl(index, shift);
         address = any ? ir.Add(address, index) : index;
@@ -245,7 +290,8 @@ std::string Mask(Ir& ir, std::string value, int width) {
     return ir.And(std::move(value), ir.Const(0xffffffffu));
 }
 
-std::string LoadMem(Ir& ir, const std::string& address, int width, std::uint64_t rip) {
+std::string LoadMem(Ir& ir, Locals& locals, const std::string& address, int width, std::uint64_t rip) {
+    locals.Spill();
     ir.Guard(address, width / 8, rip);
     const auto wasm = ir.Translate(address);
     if (width == 32) {
@@ -258,7 +304,8 @@ std::string LoadMem(Ir& ir, const std::string& address, int width, std::uint64_t
     return raw;
 }
 
-void StoreMem(Ir& ir, const std::string& address, const std::string& value, int width, std::uint64_t rip) {
+void StoreMem(Ir& ir, Locals& locals, const std::string& address, const std::string& value, int width, std::uint64_t rip) {
+    locals.Spill();
     ir.Guard(address, width / 8, rip);
     const auto wasm = ir.Translate(address);
     if (width == 32) {
@@ -269,22 +316,22 @@ void StoreMem(Ir& ir, const std::string& address, const std::string& value, int 
     ir.Line("call void @anyps5_write64(i32 " + wasm + ", i64 " + value + ")");
 }
 
-std::string LoadOperand(Ir& ir, const WasmInsn& insn, const WasmOperand& operand, int width) {
+std::string LoadOperand(Ir& ir, Locals& locals, const WasmInsn& insn, const WasmOperand& operand, int width) {
     if (operand.Kind == WasmOperandKind::Imm) return ir.Const(operand.Imm);
     if (operand.Kind == WasmOperandKind::Reg) {
         if (operand.Xmm) return ir.LoadXmm(operand.Reg, 0);
-        return Mask(ir, ir.LoadGpr(operand.Reg), width);
+        return Mask(ir, locals.Read(operand.Reg), width);
     }
-    return LoadMem(ir, AddressOf(ir, insn, operand), width, insn.Address);
+    return LoadMem(ir, locals, AddressOf(ir, locals, insn, operand), width, insn.Address);
 }
 
-void StoreOperand(Ir& ir, const WasmInsn& insn, const WasmOperand& operand, const std::string& value, int width) {
+void StoreOperand(Ir& ir, Locals& locals, const WasmInsn& insn, const WasmOperand& operand, const std::string& value, int width) {
     if (operand.Kind == WasmOperandKind::Reg) {
         if (operand.Xmm) ir.StoreXmm(operand.Reg, 0, value);
-        else ir.StoreGpr(operand.Reg, value);
+        else locals.Write(operand.Reg, value);
         return;
     }
-    StoreMem(ir, AddressOf(ir, insn, operand), value, width, insn.Address);
+    StoreMem(ir, locals, AddressOf(ir, locals, insn, operand), value, width, insn.Address);
 }
 
 int FlagKind(WasmMnemonic op) {
@@ -295,10 +342,15 @@ int FlagKind(WasmMnemonic op) {
     return 2;
 }
 
-void EmitAlu(Ir& ir, const WasmInsn& insn) {
+void EmitAlu(Ir& ir, Locals& locals, const WasmInsn& insn, bool deadFlags) {
+    if (deadFlags && (insn.Op == WasmMnemonic::Cmp || insn.Op == WasmMnemonic::Test)) {
+        if (insn.Dst.Kind == WasmOperandKind::Mem) (void)LoadOperand(ir, locals, insn, insn.Dst, insn.Width);
+        if (insn.Src.Kind == WasmOperandKind::Mem) (void)LoadOperand(ir, locals, insn, insn.Src, insn.Width);
+        return;
+    }
     const auto kind = FlagKind(insn.Op);
-    auto lhs = LoadOperand(ir, insn, insn.Dst, insn.Width);
-    std::string rhs = kind == 3 || kind == 4 ? ir.Const(1) : LoadOperand(ir, insn, insn.Src, insn.Width);
+    auto lhs = LoadOperand(ir, locals, insn, insn.Dst, insn.Width);
+    std::string rhs = kind == 3 || kind == 4 ? ir.Const(1) : LoadOperand(ir, locals, insn, insn.Src, insn.Width);
     lhs = Mask(ir, std::move(lhs), insn.Width);
     rhs = Mask(ir, std::move(rhs), insn.Width);
     std::string result;
@@ -311,10 +363,12 @@ void EmitAlu(Ir& ir, const WasmInsn& insn) {
         result = ir.Sub(lhs, rhs);
     }
     result = Mask(ir, std::move(result), insn.Width);
-    const auto flags = ir.Temp();
-    ir.Line(flags + " = call i64 @anyps5_flags(i64 " + ir.LoadFlags() + ", i64 " + result + ", i64 " + lhs + ", i64 " + rhs + ", i32 " + std::to_string(insn.Width) + ", i32 " + std::to_string(kind) + ")");
-    ir.StoreFlags(flags);
-    if (insn.Op != WasmMnemonic::Cmp && insn.Op != WasmMnemonic::Test) StoreOperand(ir, insn, insn.Dst, result, insn.Width);
+    if (!deadFlags) {
+        const auto flags = ir.Temp();
+        ir.Line(flags + " = call i64 @anyps5_flags(i64 " + locals.ReadFlags() + ", i64 " + result + ", i64 " + lhs + ", i64 " + rhs + ", i32 " + std::to_string(insn.Width) + ", i32 " + std::to_string(kind) + ")");
+        locals.WriteFlags(flags);
+    }
+    if (insn.Op != WasmMnemonic::Cmp && insn.Op != WasmMnemonic::Test) StoreOperand(ir, locals, insn, insn.Dst, result, insn.Width);
 }
 
 std::string Bit(Ir& ir, const std::string& flags, int bit) {
@@ -350,13 +404,14 @@ std::string Condition(Ir& ir, std::uint8_t cc, const std::string& flags) {
     }
 }
 
-void LoadXmmPair(Ir& ir, const WasmInsn& insn, const WasmOperand& operand, std::string& low, std::string& high) {
+void LoadXmmPair(Ir& ir, Locals& locals, const WasmInsn& insn, const WasmOperand& operand, std::string& low, std::string& high) {
     if (operand.Kind == WasmOperandKind::Reg) {
         low = ir.LoadXmm(operand.Reg, 0);
         high = ir.LoadXmm(operand.Reg, 1);
         return;
     }
-    const auto address = AddressOf(ir, insn, operand);
+    const auto address = AddressOf(ir, locals, insn, operand);
+    locals.Spill();
     ir.Guard(address, 16, insn.Address);
     const auto lowWasm = ir.Translate(address);
     const auto lowRaw = ir.Temp();
@@ -369,17 +424,17 @@ void LoadXmmPair(Ir& ir, const WasmInsn& insn, const WasmOperand& operand, std::
     high = highRaw;
 }
 
-void EmitXmm(Ir& ir, const WasmInsn& insn) {
+void EmitXmm(Ir& ir, Locals& locals, const WasmInsn& insn) {
     if (insn.Op == WasmMnemonic::Pxor) {
         std::string leftLow, leftHigh, rightLow, rightHigh;
-        LoadXmmPair(ir, insn, insn.Dst, leftLow, leftHigh);
-        LoadXmmPair(ir, insn, insn.Src, rightLow, rightHigh);
+        LoadXmmPair(ir, locals, insn, insn.Dst, leftLow, leftHigh);
+        LoadXmmPair(ir, locals, insn, insn.Src, rightLow, rightHigh);
         ir.StoreXmm(insn.Dst.Reg, 0, ir.Xor(leftLow, rightLow));
         ir.StoreXmm(insn.Dst.Reg, 1, ir.Xor(leftHigh, rightHigh));
         return;
     }
     if (insn.Op == WasmMnemonic::MovdToXmm || insn.Op == WasmMnemonic::MovqToXmm) {
-        auto value = LoadOperand(ir, insn, insn.Src, insn.Width);
+        auto value = LoadOperand(ir, locals, insn, insn.Src, insn.Width);
         value = Mask(ir, std::move(value), insn.Width);
         ir.StoreXmm(insn.Dst.Reg, 0, value);
         ir.StoreXmm(insn.Dst.Reg, 1, ir.Const(0));
@@ -387,19 +442,19 @@ void EmitXmm(Ir& ir, const WasmInsn& insn) {
     }
     auto value = ir.LoadXmm(insn.Src.Reg, 0);
     value = Mask(ir, std::move(value), insn.Width);
-    StoreOperand(ir, insn, insn.Dst, value, insn.Width);
+    StoreOperand(ir, locals, insn, insn.Dst, value, insn.Width);
 }
 
-void EmitInsn(Ir& ir, const WasmInsn& insn) {
+void EmitInsn(Ir& ir, Locals& locals, const WasmInsn& insn, bool deadFlags) {
     switch (insn.Op) {
     case WasmMnemonic::Nop:
         return;
     case WasmMnemonic::Mov:
     case WasmMnemonic::MovImm:
     case WasmMnemonic::Lea: {
-        auto value = insn.Op == WasmMnemonic::Lea ? AddressOf(ir, insn, insn.Src) : LoadOperand(ir, insn, insn.Src, insn.Width);
+        auto value = insn.Op == WasmMnemonic::Lea ? AddressOf(ir, locals, insn, insn.Src) : LoadOperand(ir, locals, insn, insn.Src, insn.Width);
         value = Mask(ir, std::move(value), insn.Width);
-        StoreOperand(ir, insn, insn.Dst, value, insn.Width);
+        StoreOperand(ir, locals, insn, insn.Dst, value, insn.Width);
         return;
     }
     case WasmMnemonic::Add:
@@ -411,28 +466,29 @@ void EmitInsn(Ir& ir, const WasmInsn& insn) {
     case WasmMnemonic::Test:
     case WasmMnemonic::Inc:
     case WasmMnemonic::Dec:
-        EmitAlu(ir, insn);
+        EmitAlu(ir, locals, insn, deadFlags);
         return;
     case WasmMnemonic::Push: {
-        const auto value = LoadOperand(ir, insn, insn.Src, 64);
-        const auto rsp = ir.LoadGpr(kRsp);
+        const auto value = LoadOperand(ir, locals, insn, insn.Src, 64);
+        const auto rsp = locals.Read(kRsp);
         const auto slot = ir.Sub(rsp, ir.Const(8));
-        StoreMem(ir, slot, value, 64, insn.Address);
-        ir.StoreGpr(kRsp, slot);
+        StoreMem(ir, locals, slot, value, 64, insn.Address);
+        locals.Write(kRsp, slot);
         return;
     }
     case WasmMnemonic::PushFlags: {
-        const auto rsp = ir.LoadGpr(kRsp);
+        const auto rsp = locals.Read(kRsp);
+        const auto flags = locals.ReadFlags();
         const auto slot = ir.Sub(rsp, ir.Const(8));
-        StoreMem(ir, slot, ir.LoadFlags(), 64, insn.Address);
-        ir.StoreGpr(kRsp, slot);
+        StoreMem(ir, locals, slot, flags, 64, insn.Address);
+        locals.Write(kRsp, slot);
         return;
     }
     case WasmMnemonic::Pop: {
-        const auto rsp = ir.LoadGpr(kRsp);
-        const auto value = LoadMem(ir, rsp, 64, insn.Address);
-        ir.StoreGpr(kRsp, ir.Add(rsp, ir.Const(8)));
-        StoreOperand(ir, insn, insn.Dst, value, 64);
+        const auto rsp = locals.Read(kRsp);
+        const auto value = LoadMem(ir, locals, rsp, 64, insn.Address);
+        locals.Write(kRsp, ir.Add(rsp, ir.Const(8)));
+        StoreOperand(ir, locals, insn, insn.Dst, value, 64);
         return;
     }
     case WasmMnemonic::MovdToXmm:
@@ -440,7 +496,7 @@ void EmitInsn(Ir& ir, const WasmInsn& insn) {
     case WasmMnemonic::MovdFromXmm:
     case WasmMnemonic::MovqFromXmm:
     case WasmMnemonic::Pxor:
-        EmitXmm(ir, insn);
+        EmitXmm(ir, locals, insn);
         return;
     case WasmMnemonic::Jmp:
     case WasmMnemonic::Jcc:
@@ -453,35 +509,218 @@ void EmitInsn(Ir& ir, const WasmInsn& insn) {
     }
 }
 
-void EmitEdge(Ir& ir, const WasmBlock& block) {
+bool WritesFlags(WasmMnemonic op) {
+    switch (op) {
+    case WasmMnemonic::Add:
+    case WasmMnemonic::Sub:
+    case WasmMnemonic::Cmp:
+    case WasmMnemonic::And:
+    case WasmMnemonic::Or:
+    case WasmMnemonic::Xor:
+    case WasmMnemonic::Test:
+    case WasmMnemonic::Inc:
+    case WasmMnemonic::Dec:
+        return true;
+    default:
+        return false;
+    }
+}
+
+int BlockAt(const std::vector<WasmBlock>& blocks, std::uint64_t address) {
+    for (int index = 0; index < static_cast<int>(blocks.size()); ++index) {
+        if (blocks[static_cast<std::size_t>(index)].Start == address) return index;
+    }
+    return -1;
+}
+
+int ImportAt(const WasmImage& image, std::uint64_t address) {
+    for (int index = 0; index < static_cast<int>(image.Imports.size()); ++index) {
+        if (image.Imports[static_cast<std::size_t>(index)].Entry == address) return index;
+    }
+    return -1;
+}
+
+std::string BlockLabel(std::uint64_t address) { return "g" + Hex(address); }
+
+struct FlagPlan {
+    std::vector<std::vector<char>> Dead;
+};
+
+FlagPlan BuildFlagPlan(const WasmImage& image, const std::vector<WasmBlock>& blocks) {
+    const int count = static_cast<int>(blocks.size());
+    std::vector<std::vector<int>> next(static_cast<std::size_t>(count));
+    std::vector<char> read(static_cast<std::size_t>(count));
+    std::vector<char> escape(static_cast<std::size_t>(count));
+    std::vector<int> calls;
+    for (int index = 0; index < count; ++index) {
+        if (blocks[static_cast<std::size_t>(index)].EdgeKind == WasmBlock::Kind::Call) calls.push_back(index);
+    }
+    for (int index = 0; index < count; ++index) {
+        const auto& block = blocks[static_cast<std::size_t>(index)];
+        auto add = [&](std::uint64_t address) {
+            const auto found = BlockAt(blocks, address);
+            if (found >= 0) next[static_cast<std::size_t>(index)].push_back(found);
+        };
+        if (block.EdgeKind == WasmBlock::Kind::Halt) {
+            read[static_cast<std::size_t>(index)] = 1;
+        } else if (block.EdgeKind == WasmBlock::Kind::Branch) {
+            read[static_cast<std::size_t>(index)] = 1;
+            add(block.Target);
+            add(block.Fall);
+        } else if (block.EdgeKind == WasmBlock::Kind::Fall) {
+            add(block.Fall);
+        } else if (block.EdgeKind == WasmBlock::Kind::Jump) {
+            if (ImportAt(image, block.Target) >= 0) escape[static_cast<std::size_t>(index)] = 1;
+            else add(block.Target);
+        } else if (block.EdgeKind == WasmBlock::Kind::Call) {
+            if (ImportAt(image, block.Target) >= 0) add(block.Fall);
+            else if (BlockAt(blocks, block.Target) >= 0) add(block.Target);
+            else escape[static_cast<std::size_t>(index)] = 1;
+        } else {
+            for (const auto call : calls) add(blocks[static_cast<std::size_t>(call)].Fall);
+            if (calls.empty()) escape[static_cast<std::size_t>(index)] = 1;
+        }
+    }
+    std::vector<char> live(static_cast<std::size_t>(count));
+    FlagPlan plan;
+    plan.Dead.resize(static_cast<std::size_t>(count));
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int index = count - 1; index >= 0; --index) {
+            bool out = read[static_cast<std::size_t>(index)] != 0 || escape[static_cast<std::size_t>(index)] != 0;
+            for (const auto successor : next[static_cast<std::size_t>(index)]) {
+                if (live[static_cast<std::size_t>(successor)] != 0) out = true;
+            }
+            bool current = out;
+            const auto& insns = blocks[static_cast<std::size_t>(index)].Insns;
+            std::vector<char> dead(insns.size());
+            for (int insn = static_cast<int>(insns.size()) - 1; insn >= 0; --insn) {
+                const auto op = insns[static_cast<std::size_t>(insn)].Op;
+                if (op == WasmMnemonic::PushFlags) current = true;
+                if (WritesFlags(op)) {
+                    dead[static_cast<std::size_t>(insn)] = current ? 0 : 1;
+                    if (op != WasmMnemonic::Inc && op != WasmMnemonic::Dec) current = false;
+                }
+            }
+            if (live[static_cast<std::size_t>(index)] != static_cast<char>(current)) {
+                live[static_cast<std::size_t>(index)] = static_cast<char>(current);
+                changed = true;
+            }
+            plan.Dead[static_cast<std::size_t>(index)] = std::move(dead);
+        }
+    }
+    return plan;
+}
+
+std::vector<std::uint64_t> CollectReturns(const std::vector<WasmBlock>& blocks) {
+    std::vector<std::uint64_t> returns;
+    for (const auto& block : blocks) {
+        if (block.EdgeKind != WasmBlock::Kind::Call || BlockAt(blocks, block.Fall) < 0) continue;
+        bool seen = false;
+        for (const auto address : returns) seen = seen || address == block.Fall;
+        if (!seen) returns.push_back(block.Fall);
+    }
+    return returns;
+}
+
+void EmitTick(Ir& ir) {
+    const auto steps = ir.Temp();
+    ir.Line(steps + " = load i32, ptr @anyps5_steps, align 4");
+    const auto stop = ir.Icmp("uge", steps, std::to_string(kStepLimit), "i32");
+    const auto body = ir.NextLabel("run");
+    ir.Line("br i1 " + stop + ", label %limit, label %" + body);
+    ir.Label(body);
+    const auto advanced = ir.Temp();
+    ir.Line(advanced + " = add i32 " + steps + ", 1");
+    ir.Line("store i32 " + advanced + ", ptr @anyps5_steps, align 4");
+}
+
+void EmitImport(Ir& ir, const WasmImage& image, int import, std::uint64_t fall, bool resume) {
+    ir.StoreRip(ir.Const(image.Imports[static_cast<std::size_t>(import)].Entry));
+    const auto status = ir.Temp();
+    ir.Line(status + " = call i32 @anyps5_import_" + std::to_string(image.Imports[static_cast<std::size_t>(import)].Kind) + "()");
+    const auto bad = ir.Icmp("ne", status, "0", "i32");
+    if (!resume) {
+        ir.Line("br i1 " + bad + ", label %fault, label %dispatch");
+        return;
+    }
+    const auto back = ir.NextLabel("back");
+    ir.Line("br i1 " + bad + ", label %fault, label %" + back);
+    ir.Label(back);
+    const auto rip = ir.Load("i64", ir.StatePtr(kRipOffset));
+    const auto same = ir.Icmp("eq", rip, ir.Const(fall));
+    ir.Line("br i1 " + same + ", label %" + BlockLabel(fall) + ", label %dispatch");
+}
+
+void EmitEdge(Ir& ir, Locals& locals, const WasmImage& image, const WasmBlock& block, const std::vector<WasmBlock>& blocks, const std::vector<std::uint64_t>& returns) {
+    auto known = [&](std::uint64_t address) { return BlockAt(blocks, address) >= 0; };
     if (block.EdgeKind == WasmBlock::Kind::Halt) {
+        locals.Spill();
         ir.StoreRip(ir.Const(block.Edge));
         ir.Branch("halt");
         return;
     }
     if (block.EdgeKind == WasmBlock::Kind::Fall || block.EdgeKind == WasmBlock::Kind::Jump) {
-        ir.StoreRip(ir.Const(block.EdgeKind == WasmBlock::Kind::Jump ? block.Target : block.Fall));
-        ir.Branch("dispatch");
+        const auto target = block.EdgeKind == WasmBlock::Kind::Jump ? block.Target : block.Fall;
+        locals.Spill();
+        const auto import = ImportAt(image, target);
+        if (import >= 0) {
+            EmitImport(ir, image, import, 0, false);
+            return;
+        }
+        if (known(target)) ir.Branch(BlockLabel(target));
+        else {
+            ir.StoreRip(ir.Const(target));
+            ir.Branch("dispatch");
+        }
         return;
     }
     if (block.EdgeKind == WasmBlock::Kind::Branch) {
-        const auto next = ir.Select(Condition(ir, block.Cc, ir.LoadFlags()), ir.Const(block.Target), ir.Const(block.Fall));
-        ir.StoreRip(next);
+        const auto cond = Condition(ir, block.Cc, locals.ReadFlags());
+        locals.Spill();
+        if (known(block.Target) && known(block.Fall)) {
+            if (block.Target == block.Fall) ir.Branch(BlockLabel(block.Target));
+            else ir.Line("br i1 " + cond + ", label %" + BlockLabel(block.Target) + ", label %" + BlockLabel(block.Fall));
+            return;
+        }
+        ir.StoreRip(ir.Select(cond, ir.Const(block.Target), ir.Const(block.Fall)));
         ir.Branch("dispatch");
         return;
     }
     if (block.EdgeKind == WasmBlock::Kind::Call) {
-        const auto rsp = ir.LoadGpr(kRsp);
+        const auto rsp = locals.Read(kRsp);
         const auto slot = ir.Sub(rsp, ir.Const(8));
-        StoreMem(ir, slot, ir.Const(block.Fall), 64, block.Edge);
-        ir.StoreGpr(kRsp, slot);
+        StoreMem(ir, locals, slot, ir.Const(block.Fall), 64, block.Edge);
+        locals.Write(kRsp, slot);
+        locals.Spill();
+        const auto import = ImportAt(image, block.Target);
+        if (import >= 0) {
+            EmitImport(ir, image, import, block.Fall, known(block.Fall));
+            return;
+        }
+        if (known(block.Target)) {
+            ir.Branch(BlockLabel(block.Target));
+            return;
+        }
         ir.StoreRip(ir.Const(block.Target));
         ir.Branch("dispatch");
         return;
     }
-    const auto rsp = ir.LoadGpr(kRsp);
-    const auto next = LoadMem(ir, rsp, 64, block.Edge);
-    ir.StoreGpr(kRsp, ir.Add(rsp, ir.Const(8)));
+    const auto rsp = locals.Read(kRsp);
+    const auto next = LoadMem(ir, locals, rsp, 64, block.Edge);
+    locals.Write(kRsp, ir.Add(rsp, ir.Const(8)));
+    locals.Spill();
+    if (returns.empty()) {
+        ir.StoreRip(next);
+        ir.Branch("dispatch");
+        return;
+    }
+    const auto slow = ir.NextLabel("ret");
+    ir.Text += "  switch i64 " + next + ", label %" + slow + " [\n";
+    for (const auto address : returns) ir.Text += "    i64 " + Number(address) + ", label %" + BlockLabel(address) + "\n";
+    ir.Text += "  ]\n";
+    ir.Label(slow);
     ir.StoreRip(next);
     ir.Branch("dispatch");
 }
@@ -578,28 +817,29 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
         ir.Line("store i64 " + now + ", ptr @anyps5_time_origin, align 8");
     }
     ir.Line("store i32 0, ptr @anyps5_steps, align 4");
-    ir.Branch("dispatch");
+    if (BlockAt(blocks, image.Entry) >= 0) ir.Branch(BlockLabel(image.Entry));
+    else ir.Branch("dispatch");
     ir.Label("dispatch");
-    const auto steps = ir.Temp();
-    ir.Line(steps + " = load i32, ptr @anyps5_steps, align 4");
-    const auto stop = ir.Icmp("uge", steps, std::to_string(kStepLimit), "i32");
-    ir.Line("br i1 " + stop + ", label %limit, label %step");
-    ir.Label("step");
-    const auto advanced = ir.Temp();
-    ir.Line(advanced + " = add i32 " + steps + ", 1");
-    ir.Line("store i32 " + advanced + ", ptr @anyps5_steps, align 4");
     const auto rip = ir.Load("i64", ir.StatePtr(kRipOffset));
     ir.Text += "  switch i64 " + rip + ", label %missing [\n";
-    for (const auto& block : blocks) ir.Text += "    i64 " + Number(block.Start) + ", label %g" + Hex(block.Start) + "\n";
+    for (const auto& block : blocks) ir.Text += "    i64 " + Number(block.Start) + ", label %" + BlockLabel(block.Start) + "\n";
     for (std::size_t index = 0; index < image.Imports.size(); ++index) ir.Text += "    i64 " + Number(image.Imports[index].Entry) + ", label %i" + std::to_string(index) + "\n";
     ir.Text += "  ]\n";
-    for (const auto& block : blocks) {
-        ir.Label("g" + Hex(block.Start));
-        for (const auto& insn : block.Insns) EmitInsn(ir, insn);
-        EmitEdge(ir, block);
+    const auto flags = BuildFlagPlan(image, blocks);
+    const auto returns = CollectReturns(blocks);
+    for (int index = 0; index < static_cast<int>(blocks.size()); ++index) {
+        const auto& block = blocks[static_cast<std::size_t>(index)];
+        ir.Label(BlockLabel(block.Start));
+        EmitTick(ir);
+        Locals locals(ir);
+        for (std::size_t insn = 0; insn < block.Insns.size(); ++insn) {
+            EmitInsn(ir, locals, block.Insns[insn], flags.Dead[static_cast<std::size_t>(index)][insn] != 0);
+        }
+        EmitEdge(ir, locals, image, block, blocks, returns);
     }
     for (std::size_t index = 0; index < image.Imports.size(); ++index) {
         ir.Label("i" + std::to_string(index));
+        EmitTick(ir);
         const auto status = ir.Temp();
         ir.Line(status + " = call i32 @anyps5_import_" + std::to_string(image.Imports[index].Kind) + "()");
         const auto bad = ir.Icmp("ne", status, "0", "i32");

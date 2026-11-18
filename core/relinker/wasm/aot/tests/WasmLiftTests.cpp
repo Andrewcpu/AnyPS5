@@ -1,6 +1,8 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <wasm/Discover.hpp>
+#include <wasm/Emit.hpp>
 #include <wasm/WasmTarget.hpp>
 #include <domain/Types.hpp>
 #include <nid/NidCompute.hpp>
@@ -1004,6 +1006,138 @@ const Relinker::Wasm::WasmImport* FindImport(const Relinker::Wasm::WasmImage& im
     return nullptr;
 }
 
+std::size_t CountText(const std::string& text, const std::string& needle) {
+    std::size_t count = 0;
+    for (std::size_t at = 0; (at = text.find(needle, at)) != std::string::npos; at += needle.size()) ++count;
+    return count;
+}
+
+std::size_t CountGprLoads(const std::string& text) {
+    std::size_t count = 0;
+    const std::string key = "load i64, ptr inttoptr (i32 ";
+    for (std::size_t at = 0; (at = text.find(key, at)) != std::string::npos; at += key.size()) {
+        const auto value = std::stoull(text.substr(at + key.size()));
+        if (value >= Relinker::Wasm::kStateAddress && value < Relinker::Wasm::kStateAddress + Relinker::Wasm::kGprBytes) ++count;
+    }
+    return count;
+}
+
+std::string ModuleText(const std::vector<std::uint8_t>& elf) {
+    const auto image = Relinker::Wasm::PlanWasmImage(elf);
+    return Relinker::Wasm::EmitWasmModule(image, Relinker::Wasm::DiscoverWasmBlocks(image));
+}
+
+void Optimized() {
+    {
+        Asm code;
+        code.B({0xbb});
+        code.U32(7);
+        code.B({0x89, 0xd8, 0x01, 0xd8, 0x89, 0xc1, 0x83, 0xc1, 0x01, 0x0f, 0x0b});
+        const auto elf = Elf(0x340000, 0x340000, code.Bytes);
+        const auto ir = ModuleText(elf);
+        ExpectEqual("promoted flag calls", CountText(ir, "call i64 @anyps5_flags"), 1);
+        ExpectEqual("promoted gpr loads", CountGprLoads(ir), 0);
+        ExpectEqual("promoted dispatch edges", CountText(ir, "br label %dispatch"), 0);
+        const auto run = RunGuest(elf);
+        Require(run.Native.Signal == SIGILL, "promoted signal");
+        ExpectEqual("promoted status", run.Status, 0);
+        ExpectEqual("promoted eax", run.Gpr[0], 14);
+        ExpectEqual("promoted ebx", run.Gpr[3], 7);
+        ExpectEqual("promoted ecx", run.Gpr[1], 15);
+        ExpectEqual("native promoted eax", run.Native.Gpr[0], 14);
+        ExpectEqual("native promoted ecx", run.Native.Gpr[1], 15);
+        ExpectFlags("promoted flags", run.Native.Flags, run.Flags, false);
+    }
+    {
+        Asm code;
+        code.B({0x48, 0xb8});
+        code.U64(0x100000001ull);
+        code.B({0x83, 0xc0, 0x01, 0x48, 0x89, 0xc1});
+        code.B({0x48, 0xb8});
+        code.U64(0x100000001ull);
+        code.B({0x89, 0xc2, 0x48, 0x83, 0xc0, 0x01, 0x0f, 0x0b});
+        const auto run = RunGuest(Elf(0x330000, 0x330000, code.Bytes));
+        Require(run.Native.Signal == SIGILL, "extend signal");
+        ExpectEqual("extend status", run.Status, 0);
+        ExpectEqual("extend rax", run.Gpr[0], 0x100000002ull);
+        ExpectEqual("extend rcx", run.Gpr[1], 2);
+        ExpectEqual("extend rdx", run.Gpr[2], 1);
+        ExpectEqual("native extend rax", run.Native.Gpr[0], run.Gpr[0]);
+        ExpectEqual("native extend rcx", run.Native.Gpr[1], run.Gpr[1]);
+        ExpectEqual("native extend rdx", run.Native.Gpr[2], run.Gpr[2]);
+    }
+    {
+        constexpr std::uint64_t base = 0x310000;
+        Asm code;
+        code.B({0xb8});
+        code.U32(1);
+        code.B({0xe8, 0x05, 0x00, 0x00, 0x00, 0x83, 0xc0, 0x01, 0x0f, 0x0b, 0x83, 0xc0, 0x01, 0xc3});
+        const auto elf = Elf(base, base, code.Bytes);
+        const auto ir = ModuleText(elf);
+        ExpectEqual("direct switches", CountText(ir, "switch i64"), 2);
+        ExpectEqual("direct dispatch edges", CountText(ir, "br label %dispatch"), 1);
+        Require(ir.find("br label %g") != std::string::npos, "known call did not branch directly");
+        const auto run = RunGuest(elf);
+        Require(run.Native.Signal == SIGILL, "direct signal");
+        ExpectEqual("direct status", run.Status, 0);
+        ExpectEqual("direct eax", run.Gpr[0], 3);
+        ExpectEqual("native direct eax", run.Native.Gpr[0], 3);
+        ExpectEqual("direct rip", run.Rip, base + 13);
+        ExpectFlags("direct flags", run.Native.Flags, run.Flags, false);
+    }
+    {
+        constexpr std::uint64_t base = 0x360000;
+        Asm code;
+        code.B({0xb8});
+        code.U32(0);
+        code.B({0x83, 0xf8, 0x01});
+        const auto jeAt = code.Bytes.size();
+        code.B({0x74, 0x00});
+        const auto callAt = code.Bytes.size();
+        code.B({0xe8, 0, 0, 0, 0});
+        const auto normal = code.Bytes.size();
+        code.B({0xb8});
+        code.U32(2);
+        code.B({0x0f, 0x0b});
+        const auto land = code.Bytes.size();
+        code.B({0xb8});
+        code.U32(1);
+        const auto landUd2 = code.Bytes.size();
+        code.B({0x0f, 0x0b});
+        const auto foo = code.Bytes.size();
+        code.B({0x48, 0x83, 0x04, 0x24, static_cast<std::uint8_t>(land - normal), 0xc3});
+        code.Bytes[jeAt + 1] = static_cast<std::uint8_t>(land - (jeAt + 2));
+        const auto displacement = static_cast<std::uint32_t>(foo - (callAt + 5));
+        for (int index = 0; index < 4; ++index) code.Bytes[callAt + 1 + static_cast<std::size_t>(index)] = static_cast<std::uint8_t>(displacement >> (8 * index));
+        const auto run = RunGuest(Elf(base, base, code.Bytes));
+        Require(run.Native.Signal == SIGILL, "fallback signal");
+        ExpectEqual("fallback status", run.Status, 0);
+        ExpectEqual("fallback eax", run.Gpr[0], 1);
+        ExpectEqual("native fallback eax", run.Native.Gpr[0], 1);
+        ExpectEqual("fallback rip", run.Rip, base + landUd2);
+        ExpectEqual("native fallback rip", run.Native.Rip, base + landUd2);
+    }
+    {
+        auto image = DecodeHex("b905000000b80000000089c789cee84a000000ffc975f383f80f753aeb020f0b83e8017c3183c00189c2660f6ec266480f7ec048c7c300010100488903488b034883c001488943084c8d43084c8d0c13660fefc90f0bb8ee0000000f0b89f801f0c3");
+        image.resize(0x120);
+        const auto ir = ModuleText(Elf(0x10000, 0x10000, image));
+        ExpectEqual("milestone flag calls", CountText(ir, "call i64 @anyps5_flags"), 5);
+        ExpectEqual("milestone rbx state", CountText(ir, "983064"), 2);
+        ExpectEqual("milestone dispatch edges", CountText(ir, "br label %dispatch"), 1);
+        ExpectEqual("milestone switches", CountText(ir, "switch i64"), 2);
+        Require(ir.find("br label %g1005d") != std::string::npos, "milestone call was not direct");
+        Require(ir.find("i64 65555, label %g10013") != std::string::npos, "milestone return was not direct");
+    }
+    bool threw = false;
+    try {
+        (void)Relinker::Wasm::CompileWasm(Elf(0x10000, 0x10000, {0xff, 0xd0}));
+    } catch (const std::exception& error) {
+        threw = true;
+        Require(std::string(error.what()).find("indirect") != std::string::npos, std::string("unexpected reject: ") + error.what());
+    }
+    Require(threw, "indirect call was lifted");
+}
+
 void Imports() {
     constexpr std::uint64_t codeVA = 0x10000;
     constexpr std::uint64_t dataVA = 0x11000;
@@ -1117,6 +1251,7 @@ int main() {
         Flags();
         GuestMemory();
         Fault();
+        Optimized();
         Imports();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
