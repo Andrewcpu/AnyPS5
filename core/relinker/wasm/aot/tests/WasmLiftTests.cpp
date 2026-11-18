@@ -1239,6 +1239,199 @@ void Imports() {
     Throws(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {}, {{"memcpy#lib#*", dataVA}}), "module ID");
 }
 
+const char* kGraphicsScript = R"(
+const fs = require('fs');
+const bytes = fs.readFileSync(process.argv[2]);
+const result = process.argv[3] === undefined ? 0 : Number(process.argv[3]);
+const slot = { memory: null, seen: [] };
+const imports = { env: { anyps5_webgpu_submit(ptr, len) {
+  const view = new Uint8Array(slot.memory.buffer, ptr, len);
+  let text = '';
+  for (let index = 0; index < view.length; index += 1) text += view[index].toString(16).padStart(2, '0');
+  slot.seen.push(text);
+  return result;
+}}};
+const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), imports);
+slot.memory = instance.exports.memory;
+const status = instance.exports.anyps5_run();
+const state = instance.exports.anyps5_state();
+const memory = new Uint8Array(instance.exports.memory.buffer);
+function hex(start, length) {
+  let text = '';
+  for (let index = 0; index < length; index += 1) text += memory[start + index].toString(16).padStart(2, '0');
+  return text;
+}
+process.stdout.write(String(status) + '\n' + slot.seen.join(',') + '\n' + hex(state, 400) + '\n');
+)";
+
+struct GraphicsGuest {
+    std::vector<std::uint8_t> Elf;
+    std::vector<std::uint8_t> Command;
+    std::uint64_t Ud2 = 0;
+};
+
+GraphicsGuest MakeGraphics(std::uint32_t opcode, std::uint32_t width, std::uint32_t height, std::uint32_t rgba, std::uint32_t shader, std::uint64_t address, std::uint64_t bytes) {
+    constexpr std::uint64_t codeVA = 0x10000;
+    constexpr std::uint64_t dataVA = 0x11000;
+    constexpr std::uint64_t got = dataVA + 0x20;
+    Asm code;
+    auto movabs = [&](std::uint8_t reg, std::uint64_t value) {
+        code.B({static_cast<std::uint8_t>(reg < 8 ? 0x48 : 0x49), static_cast<std::uint8_t>(0xb8 + (reg & 7))});
+        code.U64(value);
+    };
+    movabs(7, address);
+    movabs(6, bytes);
+    code.B({0xff, 0x15});
+    const auto next = codeVA + code.Bytes.size() + 4;
+    code.U32(static_cast<std::uint32_t>(static_cast<std::int64_t>(got) - static_cast<std::int64_t>(next)));
+    GraphicsGuest guest;
+    guest.Ud2 = codeVA + code.Bytes.size();
+    code.B({0x0f, 0x0b});
+    std::vector<std::uint8_t> data(0x28);
+    Put(data, 0, opcode, 4);
+    Put(data, 4, width, 4);
+    Put(data, 8, height, 4);
+    Put(data, 12, rgba, 4);
+    Put(data, 16, shader, 4);
+    guest.Command.assign(data.begin(), data.begin() + 20);
+    guest.Elf = DynamicElf(codeVA, code.Bytes, dataVA, data, {"libSceLibcInternal.sprx"}, {{"anyps5_webgpu_submit", got}});
+    return guest;
+}
+
+struct HostSeen {
+    int Status = 0;
+    std::string Seen;
+    std::uint64_t Rax = 0;
+    std::uint64_t Rip = 0;
+    std::uint64_t Rsp = 0;
+};
+
+HostSeen RunHost(const std::filesystem::path& directory, const std::vector<std::uint8_t>& elf, const std::string& result) {
+    const auto input = directory / "guest.elf";
+    const auto output = directory / "guest.wasm";
+    const auto script = directory / "run.js";
+    {
+        std::ofstream elfFile(input, std::ios::binary);
+        elfFile.write(reinterpret_cast<const char*>(elf.data()), static_cast<std::streamsize>(elf.size()));
+        std::ofstream scriptFile(script);
+        scriptFile << kGraphicsScript;
+    }
+    const auto linked = Run({ANYPS5_RELINKER, "--wasm", input.string(), output.string()});
+    Require(linked.Status == 0, "relinker --wasm failed: " + linked.Err + linked.Out);
+    const auto node = Run({ANYPS5_NODE, script.string(), output.string(), result});
+    Require(node.Status == 0, "graphics host failed: " + node.Err + node.Out);
+    std::istringstream lines(node.Out);
+    std::string statusText, seen, stateHex;
+    Require(static_cast<bool>(std::getline(lines, statusText) && std::getline(lines, seen) && std::getline(lines, stateHex)), "graphics dump is incomplete");
+    const auto state = FromHex(stateHex);
+    Require(state.size() == Relinker::Wasm::kStateBytes, "graphics state size");
+    HostSeen host;
+    host.Status = static_cast<int>(std::stoll(statusText));
+    host.Seen = seen;
+    host.Rax = Read64(state.data());
+    host.Rsp = Read64(state.data() + 32);
+    host.Rip = Read64(state.data() + Relinker::Wasm::kRipOffset);
+    return host;
+}
+
+std::filesystem::path CompileGraphics(const std::filesystem::path& directory, const std::string& name, const std::vector<std::uint8_t>& elf) {
+    const auto input = directory / (name + ".elf");
+    const auto output = directory / (name + ".wasm");
+    std::ofstream elfFile(input, std::ios::binary);
+    elfFile.write(reinterpret_cast<const char*>(elf.data()), static_cast<std::streamsize>(elf.size()));
+    elfFile.close();
+    const auto linked = Run({ANYPS5_RELINKER, "--wasm", input.string(), output.string()});
+    Require(linked.Status == 0, "relinker --wasm failed: " + linked.Err + linked.Out);
+    return output;
+}
+
+std::string FindChrome() {
+    const char* names[] = {"google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"};
+    for (const char* name : names) {
+        const auto found = Run({"/usr/bin/env", "sh", "-c", std::string("command -v ") + name});
+        if (found.Status != 0) continue;
+        std::string path = found.Out;
+        while (!path.empty() && (path.back() == '\n' || path.back() == '\r' || path.back() == ' ')) path.pop_back();
+        if (!path.empty()) return path;
+    }
+    return {};
+}
+
+void ExpectPixels(const std::string& out, const std::string& rgba) {
+    Require(out.find("status 0") != std::string::npos, out);
+    Require(out.find("off " + rgba) != std::string::npos, out);
+    Require(out.find("corner " + rgba) != std::string::npos, out);
+    Require(out.find("canvas presented") != std::string::npos, out);
+    Require(out.find("err none") != std::string::npos, out);
+}
+
+void WebGpu() {
+    const auto checked = Run({ANYPS5_NODE, ANYPS5_WEBGPU_RUN, "check"});
+    Require(checked.Status == 0 && checked.Out.find("ok") != std::string::npos, "shader check failed: " + checked.Err + checked.Out);
+    constexpr std::uint64_t codeVA = 0x10000;
+    constexpr std::uint64_t dataVA = 0x11000;
+    const auto clear = MakeGraphics(1, 2, 2, 0xff0000ffu, 0, dataVA, 20);
+    const auto plan = Relinker::Wasm::PlanWasmImage(clear.Elf);
+    const auto* bound = FindImport(plan, "anyps5_webgpu_submit");
+    Require(bound != nullptr && bound->Kind == static_cast<std::uint16_t>(Relinker::Wasm::WasmImportKind::Graphics), "graphics import");
+    Require(bound->Nid == Nid::ComputeNid("anyps5_webgpu_submit", ""), "graphics nid");
+    ExpectEqual("graphics slot", Read64(plan.Segments[1].Bytes.data() + 0x20), bound->Entry);
+    const auto graphicsNid = Nid::ComputeNid("anyps5_webgpu_submit", "");
+    const auto nidElf = DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {}, {{graphicsNid, dataVA, 6}});
+    const auto* nidImport = FindImport(Relinker::Wasm::PlanWasmImage(nidElf), graphicsNid);
+    Require(nidImport != nullptr && nidImport->Kind == static_cast<std::uint16_t>(Relinker::Wasm::WasmImportKind::Graphics), "raw graphics NID");
+    const auto qualified = graphicsNid + "#libSceLibcInternal#A";
+    const auto* qualifiedImport = FindImport(Relinker::Wasm::PlanWasmImage(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {}, {{qualified, dataVA}})), qualified);
+    Require(qualifiedImport != nullptr && qualifiedImport->Kind == static_cast<std::uint16_t>(Relinker::Wasm::WasmImportKind::Graphics), "qualified graphics import");
+    Throws(DynamicElf(codeVA, {0x0f, 0x0b}, dataVA, std::vector<std::uint8_t>(8), {"libSceLibcInternal.sprx"}, {{"anyps5_webgpu_draw", dataVA}}), "undefined");
+    const auto directory = std::filesystem::temp_directory_path() / ("anyps5-wasm-webgpu-" + std::to_string(getpid()));
+    std::filesystem::create_directories(directory);
+    const auto accepted = RunHost(directory, clear.Elf, "0");
+    ExpectEqual("graphics status", accepted.Status, 0);
+    Require(accepted.Seen == Hex(clear.Command.data(), clear.Command.size()), "graphics command " + accepted.Seen);
+    ExpectEqual("graphics rip", accepted.Rip, clear.Ud2);
+    ExpectEqual("graphics rax", accepted.Rax, 0);
+    ExpectEqual("graphics rsp", accepted.Rsp, plan.StackTop);
+    const auto rejected = RunHost(directory, clear.Elf, "-1");
+    ExpectEqual("graphics reject", rejected.Status, 2);
+    Require(rejected.Seen == accepted.Seen, "rejected command was not submitted");
+    ExpectEqual("graphics reject rip", rejected.Rip, bound->Entry);
+    ExpectEqual("graphics reject rax", rejected.Rax, 0);
+    const auto shortGuest = MakeGraphics(1, 2, 2, 0xff0000ffu, 0, dataVA, 4);
+    const auto shortPlan = Relinker::Wasm::PlanWasmImage(shortGuest.Elf);
+    const auto shortRun = RunHost(directory, shortGuest.Elf, "0");
+    ExpectEqual("graphics short", shortRun.Status, 2);
+    Require(shortRun.Seen.empty(), "short command reached the host");
+    ExpectEqual("graphics short rip", shortRun.Rip, shortPlan.Imports[0].Entry);
+    const auto outside = MakeGraphics(1, 2, 2, 0xff0000ffu, 0, 0, 20);
+    const auto outsidePlan = Relinker::Wasm::PlanWasmImage(outside.Elf);
+    const auto outsideRun = RunHost(directory, outside.Elf, "0");
+    ExpectEqual("graphics outside", outsideRun.Status, 2);
+    Require(outsideRun.Seen.empty(), "outside command reached the host");
+    ExpectEqual("graphics outside rip", outsideRun.Rip, outsidePlan.Imports[0].Entry);
+    const auto chrome = FindChrome();
+    if (chrome.empty()) {
+        std::filesystem::remove_all(directory);
+        std::cerr << "webgpu browser test skipped: chrome not found\n";
+        return;
+    }
+    const auto draw = MakeGraphics(2, 4, 4, 0xffff0000u, 1, dataVA, 20);
+    const auto unknown = MakeGraphics(9, 2, 2, 0xff0000ffu, 0, dataVA, 20);
+    const auto clearWasm = CompileGraphics(directory, "clear", clear.Elf);
+    const auto drawWasm = CompileGraphics(directory, "draw", draw.Elf);
+    const auto unknownWasm = CompileGraphics(directory, "unknown", unknown.Elf);
+    const auto cleared = Run({ANYPS5_NODE, ANYPS5_WEBGPU_RUN, "browser", chrome, clearWasm.string()});
+    Require(cleared.Status == 0, "clear browser failed: " + cleared.Err + cleared.Out);
+    ExpectPixels(cleared.Out, "255,0,0,255");
+    const auto drawn = Run({ANYPS5_NODE, ANYPS5_WEBGPU_RUN, "browser", chrome, drawWasm.string()});
+    Require(drawn.Status == 0, "draw browser failed: " + drawn.Err + drawn.Out);
+    ExpectPixels(drawn.Out, "0,0,255,255");
+    const auto faulted = Run({ANYPS5_NODE, ANYPS5_WEBGPU_RUN, "browser", chrome, unknownWasm.string()});
+    Require(faulted.Status == 0, "unknown browser failed: " + faulted.Err + faulted.Out);
+    Require(faulted.Out.find("fault 2") != std::string::npos && faulted.Out.find("unknown webgpu opcode") != std::string::npos, faulted.Out);
+    std::filesystem::remove_all(directory);
+}
+
 }
 
 int main() {
@@ -1253,6 +1446,7 @@ int main() {
         Fault();
         Optimized();
         Imports();
+        WebGpu();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

@@ -36,6 +36,7 @@ enum class WasmImportKind : std::uint16_t {
     Memset = 2,
     Strlen = 3,
     ProcessTime = 4,
+    Graphics = 5,
 };
 
 struct WasmImport {

@@ -118,6 +118,26 @@ std::string EmitWasmImports(const WasmImage& image) {
         text += StoreRax("%ticks");
         text += "  %returned = call i32 @anyps5_guest_return()\n  ret i32 %returned\n}\n";
     }
+    if (WasmImportsUse(image, WasmImportKind::Graphics)) {
+        const char* group = WasmImportsUse(image, WasmImportKind::ProcessTime) ? "1" : "0";
+        text += "declare i32 @anyps5_webgpu_submit(i32, i32) #";
+        text += group;
+        text += "\nattributes #";
+        text += group;
+        text += " = { \"wasm-import-module\"=\"env\" \"wasm-import-name\"=\"anyps5_webgpu_submit\" }\n";
+        text += "define internal i32 @anyps5_import_5() {\nentry:\n";
+        text += LoadGpr(7, "command");
+        text += LoadGpr(6, "bytes");
+        text += "  %sized = icmp eq i64 %bytes, 20\n  br i1 %sized, label %span, label %fail\nspan:\n";
+        text += "  %badspan = call i32 @anyps5_span_ok(i64 %command, i64 20)\n  %faulted = icmp ne i32 %badspan, 0\n";
+        text += "  br i1 %faulted, label %fail, label %call\ncall:\n";
+        text += "  %wasm = call i32 @anyps5_translate(i64 %command)\n";
+        text += "  %accepted = call i32 @anyps5_webgpu_submit(i32 %wasm, i32 20)\n";
+        text += "  %bad = icmp slt i32 %accepted, 0\n  br i1 %bad, label %fail, label %store\nstore:\n";
+        text += "  %wide = zext i32 %accepted to i64\n";
+        text += StoreRax("%wide");
+        text += ReturnTail();
+    }
     return text;
 }
 
