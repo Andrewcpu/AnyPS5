@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { createServer as createNet } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -65,6 +66,24 @@ function freePort() {
     });
 }
 
+async function chromeProfile() {
+    const roots = ['/tmp', '/private/tmp', '/var/tmp', tmpdir()];
+    const seen = new Set();
+    for (const root of roots) {
+        if (!root || seen.has(root)) continue;
+        seen.add(root);
+        const prefix = join(root, 'aps5-');
+        if ((prefix + 'XXXXXX/SingletonSocket').length >= 100) continue;
+        try {
+            await access(root, constants.W_OK);
+        } catch {
+            continue;
+        }
+        return { profile: await mkdtemp(prefix), temp: root };
+    }
+    fail('chrome profile path is too long for a unix socket');
+}
+
 async function browser(chrome, wasmPath) {
     if (!chrome || !wasmPath) fail('browser requires chrome and a wasm module');
     const wasm = await readFile(wasmPath);
@@ -111,7 +130,7 @@ document.getElementById('out').textContent = window.result;
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const httpPort = server.address().port;
     const debugPort = await freePort();
-    const profile = await mkdtemp(join(tmpdir(), 'anyps5-webgpu-'));
+    const { profile, temp } = await chromeProfile();
     const chromeLog = [];
     const child = spawn(chrome, [
         '--headless=new',
@@ -125,7 +144,11 @@ document.getElementById('out').textContent = window.result;
         '--remote-debugging-port=' + debugPort,
         '--remote-allow-origins=*',
         'about:blank',
-    ], { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+    ], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        detached: true,
+        env: { ...process.env, TMPDIR: temp, TEMP: temp, TMP: temp },
+    });
     child.stderr.on('data', (chunk) => {
         chromeLog.push(chunk.toString());
         if (chromeLog.join('').length > 4000) chromeLog.splice(0, chromeLog.length - 4);
