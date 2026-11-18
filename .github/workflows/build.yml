@@ -155,7 +155,7 @@ jobs:
             const relinkerHosts = (full, linux, intelMac = true) => JSON.stringify([
               ...(full && linux ? [] : [{ os: 'ubuntu-latest', compiler: 'g++' }]),
               ...(full ? [] : [{ os: 'windows-latest', compiler: 'g++' }]),
-              { os: 'macos-15-intel', compiler: 'clang++' },
+              { os: 'macos-latest', compiler: 'clang++' },
               ...(intelMac ? [{ os: 'macos-latest', compiler: 'clang++', architectures: 'x86_64' }] : []),
             ]);
             if (context.eventName === 'push') {
@@ -292,7 +292,7 @@ jobs:
   relinker:
     needs: eligibility
     if: ${{ needs.eligibility.outputs.relinker == 'true' }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-latest' && 'macos-15' || matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
