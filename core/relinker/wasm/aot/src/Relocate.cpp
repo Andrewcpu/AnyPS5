@@ -97,6 +97,18 @@ std::uint64_t SymbolValue(const WasmImage& image, const Symbol& symbol, std::uin
     return symbol.Value;
 }
 
+bool ExecutablePointer(const WasmImage& image, std::uint64_t value) {
+    for (const auto& segment : image.Segments) {
+        if ((segment.Flags & 1u) == 0 || segment.FileSize == 0) continue;
+        if (value >= segment.Virtual && value < segment.Virtual + segment.FileSize) return true;
+    }
+    return false;
+}
+
+void NoteCode(WasmImage& image, std::uint64_t value) {
+    if (ExecutablePointer(image, value)) image.CodeRoots.push_back(value);
+}
+
 void Write(WasmImage& image, std::uint64_t address, std::uint64_t value, int size, std::vector<std::pair<std::uint64_t, std::uint64_t>>& used) {
     if (size <= 0) return;
     const auto bytes = static_cast<std::uint64_t>(size);
@@ -123,18 +135,24 @@ void ApplyOne(WasmImage& image, std::uint64_t place, std::uint32_t type, std::in
     if (type == 3 || type == 9 || type == 25 || type == 26 || type == 41 || type == 42) Fail("wasm: unsupported relocation type");
     const auto added = [&](std::uint64_t base) { return base + static_cast<std::uint64_t>(addend); };
     if (type == 8) {
-        Write(image, place, static_cast<std::uint64_t>(addend), 8, used);
+        const auto value = static_cast<std::uint64_t>(addend);
+        Write(image, place, value, 8, used);
+        NoteCode(image, value);
         return;
     }
     if (symbol == nullptr) Fail("wasm: relocation symbol table is missing");
     const auto resolved = [&] { return SymbolValue(image, *symbol, symbolIndex); };
     if (type == 6 || type == 7) {
         if (addend != 0) Fail("wasm: nonzero GLOB_DAT or JUMP_SLOT addend");
-        Write(image, place, resolved(), 8, used);
+        const auto value = resolved();
+        Write(image, place, value, 8, used);
+        NoteCode(image, value);
         return;
     }
     if (type == 1) {
-        Write(image, place, added(resolved()), 8, used);
+        const auto value = added(resolved());
+        Write(image, place, value, 8, used);
+        NoteCode(image, value);
         return;
     }
     if (type == 10) {
@@ -255,9 +273,9 @@ void ApplyDynamic(const std::vector<std::uint8_t>& elf, WasmImage& image, std::v
         saw = true;
         const auto offset = Read64(elf, header + 8);
         const auto size = Read64(elf, header + 32);
-        if (size % 16 != 0 || !Fits(offset, size, elf.size())) Fail("wasm: dynamic segment is truncated");
+        if (size < 16 || !Fits(offset, size, elf.size())) Fail("wasm: dynamic segment is truncated");
         bool terminated = false;
-        for (std::uint64_t cursor = 0; cursor < size; cursor += 16) {
+        for (std::uint64_t cursor = 0; cursor + 16 <= size; cursor += 16) {
             const auto tag = static_cast<std::int64_t>(Read64(elf, static_cast<std::size_t>(offset + cursor)));
             const auto value = Read64(elf, static_cast<std::size_t>(offset + cursor + 8));
             if (tag == 0) {
@@ -288,7 +306,7 @@ void ApplyDynamic(const std::vector<std::uint8_t>& elf, WasmImage& image, std::v
                 haveJmp = true;
             }
         }
-        if (!terminated) Fail("wasm: dynamic segment is not terminated");
+        if (!terminated) Fail(size % 16 == 0 ? "wasm: dynamic segment is not terminated" : "wasm: dynamic segment is truncated");
     }
     if ((!haveRela || relasz == 0) && (!haveJmp || pltrelsz == 0)) return;
     if (haveRela && relasz != 0 && relaent != 24) Fail("wasm: unexpected relocation entry size");

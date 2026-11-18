@@ -88,12 +88,13 @@ constexpr Wrapper kWrappers[] = {
     {"strlen", WasmImportKind::Strlen},
     {"sceKernelGetProcessTime", WasmImportKind::ProcessTime},
     {"anyps5_webgpu_submit", WasmImportKind::Graphics},
+    {"puts", WasmImportKind::Puts},
 };
 
 std::uint16_t Lookup(const std::string& key, bool qualified, bool hashPlain) {
     if (key.empty()) Fail("wasm: undefined import");
     for (const auto& wrapper : kWrappers) {
-        if (key == Nid::ComputeNid(wrapper.Name, "")) return static_cast<std::uint16_t>(wrapper.Kind);
+        if (key == wrapper.Name || key == Nid::ComputeNid(wrapper.Name, "")) return static_cast<std::uint16_t>(wrapper.Kind);
     }
     if (qualified || !hashPlain) Fail("wasm: undefined import " + key);
     const auto nid = Nid::ComputeNid(key, "");
@@ -131,9 +132,9 @@ void PrepareWasmImports(const std::vector<std::uint8_t>& elf, WasmImage& image) 
         saw = true;
         const auto offset = Read64(elf, header + 8);
         const auto size = Read64(elf, header + 32);
-        if (size % 16 != 0 || !Fits(offset, size, elf.size())) Fail("wasm: dynamic segment is truncated");
+        if (size < 16 || !Fits(offset, size, elf.size())) Fail("wasm: dynamic segment is truncated");
         bool terminated = false;
-        for (std::uint64_t cursor = 0; cursor < size; cursor += 16) {
+        for (std::uint64_t cursor = 0; cursor + 16 <= size; cursor += 16) {
             const auto tag = static_cast<std::int64_t>(Read64(elf, static_cast<std::size_t>(offset + cursor)));
             const auto value = Read64(elf, static_cast<std::size_t>(offset + cursor + 8));
             if (tag == 0) {
@@ -149,7 +150,7 @@ void PrepareWasmImports(const std::vector<std::uint8_t>& elf, WasmImage& image) 
                 haveStrsz = true;
             }
         }
-        if (!terminated) Fail("wasm: dynamic segment is not terminated");
+        if (!terminated) Fail(size % 16 == 0 ? "wasm: dynamic segment is not terminated" : "wasm: dynamic segment is truncated");
     }
     if (needed.empty()) return;
     if (!haveStrtab || !haveStrsz) Fail("wasm: dynamic string table is missing");

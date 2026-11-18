@@ -9,7 +9,7 @@
 namespace Relinker::Wasm {
 
 struct WasmBlock {
-    enum class Kind : std::uint8_t { Fall, Jump, Branch, Call, Return, Halt };
+    enum class Kind : std::uint8_t { Fall, Jump, Branch, Call, Return, Halt, IndirectCall, IndirectJump };
 
     std::uint64_t Start = 0;
     std::uint64_t Edge = 0;
@@ -17,6 +17,7 @@ struct WasmBlock {
     std::uint64_t Fall = 0;
     std::uint8_t Cc = 0;
     Kind EdgeKind = Kind::Fall;
+    WasmInsn EdgeInsn;
     std::vector<WasmInsn> Insns;
 };
 

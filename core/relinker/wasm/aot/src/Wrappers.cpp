@@ -138,6 +138,27 @@ std::string EmitWasmImports(const WasmImage& image) {
         text += StoreRax("%wide");
         text += ReturnTail();
     }
+    if (WasmImportsUse(image, WasmImportKind::Puts)) {
+        int group = 0;
+        if (WasmImportsUse(image, WasmImportKind::ProcessTime)) ++group;
+        if (WasmImportsUse(image, WasmImportKind::Graphics)) ++group;
+        text += "declare void @anyps5_host_putc(i32) #";
+        text += std::to_string(group);
+        text += "\nattributes #";
+        text += std::to_string(group);
+        text += " = { \"wasm-import-module\"=\"env\" \"wasm-import-name\"=\"anyps5_host_putc\" }\n";
+        text += "define internal i32 @anyps5_import_6() {\nentry:\n";
+        text += LoadGpr(7, "text");
+        text += "  %len = call i64 @anyps5_length(i64 %text)\n  %bad = icmp eq i64 %len, -1\n";
+        text += "  br i1 %bad, label %fail, label %loop\n";
+        text += "loop:\n  %index = phi i64 [ 0, %entry ], [ %next, %write ]\n  %done = icmp uge i64 %index, %len\n";
+        text += "  br i1 %done, label %nl, label %write\nwrite:\n  %addr = add i64 %text, %index\n";
+        text += "  %wasm = call i32 @anyps5_translate(i64 %addr)\n  %byte = call i32 @anyps5_read8(i32 %wasm)\n";
+        text += "  call void @anyps5_host_putc(i32 %byte)\n  %next = add i64 %index, 1\n  br label %loop\nnl:\n";
+        text += "  call void @anyps5_host_putc(i32 10)\n  %count = add i64 %len, 1\n";
+        text += StoreRax("%count");
+        text += ReturnTail();
+    }
     return text;
 }
 

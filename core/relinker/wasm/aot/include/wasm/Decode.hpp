@@ -10,6 +10,8 @@ enum class WasmMnemonic : std::uint8_t {
     Nop,
     Mov,
     MovImm,
+    Movsxd,
+    Cdqe,
     Lea,
     Add,
     Sub,
@@ -18,6 +20,12 @@ enum class WasmMnemonic : std::uint8_t {
     Or,
     Xor,
     Test,
+    Shl,
+    Shr,
+    Sar,
+    Imul,
+    Imul3,
+    Div,
     Inc,
     Dec,
     Push,
@@ -27,7 +35,10 @@ enum class WasmMnemonic : std::uint8_t {
     Jcc,
     Call,
     CallSlot,
+    CallInd,
     JmpSlot,
+    JmpInd,
+    Setcc,
     Ret,
     Halt,
     MovdToXmm,
@@ -59,6 +70,7 @@ struct WasmInsn {
     std::uint64_t Address = 0;
     std::uint64_t Next = 0;
     std::uint64_t Target = 0;
+    std::uint64_t Extra = 0;
     WasmOperand Dst;
     WasmOperand Src;
 };

@@ -37,6 +37,7 @@ enum class WasmImportKind : std::uint16_t {
     Strlen = 3,
     ProcessTime = 4,
     Graphics = 5,
+    Puts = 6,
 };
 
 struct WasmImport {
@@ -56,6 +57,7 @@ struct WasmImage {
     bool HashPlainImports = false;
     std::vector<WasmSegment> Segments;
     std::vector<WasmImport> Imports;
+    std::vector<std::uint64_t> CodeRoots;
 };
 
 [[nodiscard]] inline bool WasmImportsUse(const WasmImage& image, WasmImportKind kind) {

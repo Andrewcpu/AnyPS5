@@ -292,8 +292,8 @@ jobs:
   relinker:
     needs: eligibility
     if: ${{ needs.eligibility.outputs.relinker == 'true' }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    runs-on: ${{ matrix.os == 'macos-latest' && 'macos-15-intel' || matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

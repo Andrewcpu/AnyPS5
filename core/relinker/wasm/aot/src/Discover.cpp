@@ -71,6 +71,9 @@ void AddTarget(const WasmImage& image, std::set<std::uint64_t>& extra, std::uint
 std::vector<WasmBlock> DiscoverWasmBlocks(const WasmImage& image) {
     std::set<std::uint64_t> starts;
     starts.insert(image.Entry);
+    for (const auto root : image.CodeRoots) {
+        if (Executable(image, root)) starts.insert(root);
+    }
     std::vector<WasmBlock> blocks;
     bool grew = true;
     while (grew) {
@@ -97,6 +100,7 @@ std::vector<WasmBlock> DiscoverWasmBlocks(const WasmImage& image) {
                 if (WasmTerminates(insn.Op)) {
                     block.Edge = insn.Address;
                     block.Cc = insn.Cc;
+                    block.EdgeInsn = insn;
                     block.Target = insn.Op == WasmMnemonic::CallSlot || insn.Op == WasmMnemonic::JmpSlot ? ResolveSlot(image, insn) : insn.Target;
                     block.Fall = insn.Next;
                     if (insn.Op == WasmMnemonic::Jmp || insn.Op == WasmMnemonic::JmpSlot) {
@@ -110,6 +114,11 @@ std::vector<WasmBlock> DiscoverWasmBlocks(const WasmImage& image) {
                         block.EdgeKind = WasmBlock::Kind::Call;
                         AddTarget(image, extra, block.Target);
                         AddTarget(image, extra, insn.Next);
+                    } else if (insn.Op == WasmMnemonic::CallInd) {
+                        block.EdgeKind = WasmBlock::Kind::IndirectCall;
+                        AddTarget(image, extra, insn.Next);
+                    } else if (insn.Op == WasmMnemonic::JmpInd) {
+                        block.EdgeKind = WasmBlock::Kind::IndirectJump;
                     } else if (insn.Op == WasmMnemonic::Ret) {
                         block.EdgeKind = WasmBlock::Kind::Return;
                     } else {
