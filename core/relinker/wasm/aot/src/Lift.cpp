@@ -1272,6 +1272,216 @@ std::vector<std::uint8_t> Content(const WasmSegment& segment) {
     return {segment.Bytes.begin(), segment.Bytes.begin() + static_cast<std::ptrdiff_t>(segment.ContentSize)};
 }
 
+bool IsGpr(const WasmOperand& operand) {
+    return operand.Kind == WasmOperandKind::Reg && !operand.Xmm && operand.Reg >= 0 && operand.Reg < 16;
+}
+
+bool StackSlot(const WasmOperand& operand, int& base, std::int64_t& displacement) {
+    if (operand.Kind != WasmOperandKind::Mem || operand.Rip || operand.Index >= 0 || operand.Base < 0) return false;
+    base = operand.Base;
+    displacement = operand.Disp;
+    return true;
+}
+
+bool SameSlot(const WasmOperand& operand, int base, std::int64_t displacement) {
+    int got = -1;
+    std::int64_t gotDisp = 0;
+    return StackSlot(operand, got, gotDisp) && got == base && gotDisp == displacement;
+}
+
+bool SlotsOverlap(std::int64_t left, int leftSize, std::int64_t right, int rightSize) {
+    return left < right + rightSize && right < left + leftSize;
+}
+
+struct CountedFill {
+    int Frame = -1;
+    std::int64_t IndexDisp = 0;
+    std::int64_t LimitDisp = 0;
+    std::int64_t BaseDisp = 0;
+    std::int64_t ValueDisp = 0;
+    std::int64_t StoreDisp = 0;
+    int IndexReg = -1;
+    int BaseReg = -1;
+    int IdxReg = -1;
+    int ValueReg = -1;
+    int NextReg = -1;
+    std::uint64_t BaseAddress = 0;
+    std::uint64_t ValueAddress = 0;
+};
+
+bool MatchCountedFill(const WasmBlock& header, const std::vector<WasmBlock>& blocks, CountedFill& fill) {
+    if (header.EdgeKind != WasmBlock::Kind::Branch || header.Cc != 3 || header.Insns.size() != 2) return false;
+    if (header.Target == header.Fall || BlockAt(blocks, header.Target) < 0) return false;
+    const auto bodyAt = BlockAt(blocks, header.Fall);
+    if (bodyAt < 0) return false;
+    const auto& body = blocks[static_cast<std::size_t>(bodyAt)];
+    if (body.Start != header.Fall || body.EdgeKind != WasmBlock::Kind::Jump || body.Target != header.Start || body.Insns.size() != 7) return false;
+    const auto& widen = header.Insns[0];
+    const auto& compare = header.Insns[1];
+    if (widen.Op != WasmMnemonic::Movsxd || !IsGpr(widen.Dst)) return false;
+    int frame = -1;
+    std::int64_t indexDisp = 0;
+    if (!StackSlot(widen.Src, frame, indexDisp)) return false;
+    if (compare.Op != WasmMnemonic::Cmp || compare.Width != 64 || !IsGpr(compare.Dst) || compare.Dst.Reg != widen.Dst.Reg) return false;
+    int limitBase = -1;
+    std::int64_t limitDisp = 0;
+    if (!StackSlot(compare.Src, limitBase, limitDisp) || limitBase != frame) return false;
+    const auto& loadBase = body.Insns[0];
+    const auto& loadIndex = body.Insns[1];
+    const auto& loadValue = body.Insns[2];
+    const auto& store = body.Insns[3];
+    const auto& reload = body.Insns[4];
+    const auto& add = body.Insns[5];
+    const auto& writeIndex = body.Insns[6];
+    if (loadBase.Op != WasmMnemonic::Mov || loadBase.Width != 64 || !IsGpr(loadBase.Dst)) return false;
+    int baseBase = -1;
+    std::int64_t baseDisp = 0;
+    if (!StackSlot(loadBase.Src, baseBase, baseDisp) || baseBase != frame) return false;
+    if (loadIndex.Op != WasmMnemonic::Movsxd || !IsGpr(loadIndex.Dst) || !SameSlot(loadIndex.Src, frame, indexDisp)) return false;
+    if (loadValue.Op != WasmMnemonic::Mov || loadValue.Width != 32 || !IsGpr(loadValue.Dst)) return false;
+    int valueBase = -1;
+    std::int64_t valueDisp = 0;
+    if (!StackSlot(loadValue.Src, valueBase, valueDisp) || valueBase != frame) return false;
+    if (store.Op != WasmMnemonic::Mov || store.Width != 32 || !IsGpr(store.Src) || store.Src.Reg != loadValue.Dst.Reg) return false;
+    if (store.Dst.Kind != WasmOperandKind::Mem || store.Dst.Rip || store.Dst.Base != loadBase.Dst.Reg || store.Dst.Index != loadIndex.Dst.Reg || store.Dst.Scale != 4) return false;
+    if (reload.Op != WasmMnemonic::Mov || reload.Width != 32 || !IsGpr(reload.Dst) || !SameSlot(reload.Src, frame, indexDisp)) return false;
+    if (add.Op != WasmMnemonic::Add || add.Width != 32 || !IsGpr(add.Dst) || add.Dst.Reg != reload.Dst.Reg || add.Src.Kind != WasmOperandKind::Imm || add.Src.Imm != 1) return false;
+    if (writeIndex.Op != WasmMnemonic::Mov || writeIndex.Width != 32 || !IsGpr(writeIndex.Src) || writeIndex.Src.Reg != reload.Dst.Reg || !SameSlot(writeIndex.Dst, frame, indexDisp)) return false;
+    const int written[] = {widen.Dst.Reg, loadBase.Dst.Reg, loadIndex.Dst.Reg, loadValue.Dst.Reg, reload.Dst.Reg};
+    for (const auto reg : written) {
+        if (reg == frame) return false;
+    }
+    const std::int64_t slots[] = {indexDisp, limitDisp, baseDisp, valueDisp};
+    const int sizes[] = {4, 8, 8, 4};
+    for (int left = 0; left < 4; ++left) {
+        for (int right = left + 1; right < 4; ++right) {
+            if (SlotsOverlap(slots[left], sizes[left], slots[right], sizes[right])) return false;
+        }
+    }
+    fill.Frame = frame;
+    fill.IndexDisp = indexDisp;
+    fill.LimitDisp = limitDisp;
+    fill.BaseDisp = baseDisp;
+    fill.ValueDisp = valueDisp;
+    fill.StoreDisp = store.Dst.Disp;
+    fill.IndexReg = widen.Dst.Reg;
+    fill.BaseReg = loadBase.Dst.Reg;
+    fill.IdxReg = loadIndex.Dst.Reg;
+    fill.ValueReg = loadValue.Dst.Reg;
+    fill.NextReg = reload.Dst.Reg;
+    fill.BaseAddress = loadBase.Address;
+    fill.ValueAddress = loadValue.Address;
+    return true;
+}
+
+std::string SlotAddress(Ir& ir, const std::string& frame, std::int64_t displacement) {
+    if (displacement == 0) return frame;
+    return ir.Add(frame, ir.Const(static_cast<std::uint64_t>(displacement)));
+}
+
+void StoreGuest32(Ir& ir, const std::string& guest, const std::string& value) {
+    const auto wasm = ir.Trunc32(ir.Sub(guest, ir.Const(ir.guestBase)));
+    ir.Store("i32", value, ir.IntToPtr(wasm));
+}
+
+std::string CompareFlags(Ir& ir, const std::string& old, const std::string& lhs, const std::string& rhs) {
+    const auto flags = ir.Temp();
+    ir.Line(flags + " = call i64 @anyps5_flags(i64 " + old + ", i64 " + ir.Sub(lhs, rhs) + ", i64 " + lhs + ", i64 " + rhs + ", i32 64, i32 1)");
+    return flags;
+}
+
+std::string RangeRejected(Ir& ir, const WasmImage& image, const std::string& start, const std::string& end) {
+    const auto wrap = ir.Icmp("ult", end, start);
+    const auto below = ir.Icmp("ult", start, ir.Const(image.GuestBase));
+    const auto above = ir.Icmp("ugt", end, ir.Const(image.GuestLimit));
+    const auto imageBad = ir.BitOp("or", ir.BitOp("or", wrap, below), above);
+    const auto directEnd = ir.Load("i64", "inttoptr (i32 " + std::to_string(kScratchAddress + kHostDirectEnd) + " to ptr)");
+    const auto heapBelow = ir.Icmp("ult", start, ir.Const(image.GuestBase + kMemoryBytes));
+    const auto heapAbove = ir.Icmp("ugt", end, directEnd);
+    const auto outside = ir.BitOp("or", ir.BitOp("or", wrap, heapBelow), heapAbove);
+    return ir.BitOp("and", imageBad, outside);
+}
+
+std::string RangeHits(Ir& ir, const std::string& start, const std::string& end, const std::string& slot, int size) {
+    const auto slotEnd = ir.Add(slot, ir.Const(static_cast<std::uint64_t>(size)));
+    return ir.BitOp("and", ir.Icmp("ult", start, slotEnd), ir.Icmp("ult", slot, end));
+}
+
+bool EmitCountedFill(Ir& ir, Locals& locals, const WasmImage& image, const WasmBlock& header, const std::vector<WasmBlock>& blocks, const std::vector<std::uint64_t>& returns) {
+    CountedFill fill;
+    if (!MatchCountedFill(header, blocks, fill)) return false;
+    const auto frame = locals.Read(fill.Frame);
+    const auto oldFlags = locals.ReadFlags();
+    const auto indexAddr = SlotAddress(ir, frame, fill.IndexDisp);
+    const auto limitAddr = SlotAddress(ir, frame, fill.LimitDisp);
+    const auto baseAddr = SlotAddress(ir, frame, fill.BaseDisp);
+    const auto valueAddr = SlotAddress(ir, frame, fill.ValueDisp);
+    const auto initial = LoadMem(ir, locals, indexAddr, 32, header.Insns[0].Address);
+    const auto limit = LoadMem(ir, locals, limitAddr, 64, header.Insns[1].Address);
+    const auto cap = ir.Const(0x7fffffff);
+    const auto bounded = ir.BitOp("and", ir.Icmp("ule", initial, cap), ir.Icmp("ule", limit, cap));
+    const auto slow = ir.NextLabel("fillslow");
+    const auto decided = ir.NextLabel("filldecided");
+    ir.Line("br i1 " + bounded + ", label %" + decided + ", label %" + slow);
+    ir.Label(decided);
+    const auto hot = ir.NextLabel("fillhot");
+    const auto zero = ir.NextLabel("fillzero");
+    const auto runs = ir.Icmp("ult", initial, limit);
+    ir.Line("br i1 " + runs + ", label %" + hot + ", label %" + zero);
+    ir.Label(zero);
+    ir.StoreFlags(CompareFlags(ir, oldFlags, initial, limit));
+    ir.StoreGpr(fill.IndexReg, initial);
+    Enter(ir, header.Target, header.Target <= header.Edge);
+    ir.Label(hot);
+    const auto base = LoadMem(ir, locals, baseAddr, 64, fill.BaseAddress);
+    const auto value = LoadMem(ir, locals, valueAddr, 32, fill.ValueAddress);
+    auto start = ir.Add(base, ir.Shl(initial, 2));
+    if (fill.StoreDisp != 0) start = ir.Add(start, ir.Const(static_cast<std::uint64_t>(fill.StoreDisp)));
+    const auto count = ir.Sub(limit, initial);
+    const auto end = ir.Add(start, ir.Shl(count, 2));
+    const auto outside = RangeRejected(ir, image, start, end);
+    auto hits = RangeHits(ir, start, end, indexAddr, 4);
+    hits = ir.BitOp("or", hits, RangeHits(ir, start, end, limitAddr, 8));
+    hits = ir.BitOp("or", hits, RangeHits(ir, start, end, baseAddr, 8));
+    hits = ir.BitOp("or", hits, RangeHits(ir, start, end, valueAddr, 4));
+    const auto blocked = ir.BitOp("or", outside, hits);
+    const auto head = ir.NextLabel("fillhead");
+    ir.Line("br i1 " + blocked + ", label %" + slow + ", label %" + head);
+    const auto loop = ir.NextLabel("fillloop");
+    const auto chunk = ir.NextLabel("fillbody");
+    const auto leave = ir.NextLabel("fillleave");
+    const auto next = ir.Temp();
+    ir.Label(head);
+    ir.Branch(loop);
+    ir.Label(loop);
+    const auto index = ir.Temp();
+    ir.Line(index + " = phi i64 [ 0, %" + head + " ], [ " + next + ", %" + chunk + " ]");
+    const auto done = ir.Icmp("uge", index, count);
+    ir.Line("br i1 " + done + ", label %" + leave + ", label %" + chunk);
+    ir.Label(chunk);
+    const auto address = ir.Add(start, ir.Shl(index, 2));
+    StoreGuest32(ir, address, ir.Trunc32(value));
+    ir.Line(next + " = add i64 " + index + ", 1");
+    ir.Branch(loop);
+    ir.Label(leave);
+    ir.StoreFlags(CompareFlags(ir, oldFlags, limit, limit));
+    std::string finalReg[16];
+    finalReg[fill.BaseReg] = base;
+    finalReg[fill.IdxReg] = ir.Sub(limit, ir.Const(1));
+    finalReg[fill.ValueReg] = value;
+    finalReg[fill.NextReg] = limit;
+    finalReg[fill.IndexReg] = limit;
+    for (int reg = 0; reg < 16; ++reg) {
+        if (!finalReg[reg].empty()) ir.StoreGpr(reg, finalReg[reg]);
+    }
+    StoreGuest32(ir, indexAddr, ir.Trunc32(limit));
+    Enter(ir, header.Target, header.Target <= header.Edge);
+    ir.Label(slow);
+    for (const auto& instruction : header.Insns) EmitInsn(ir, locals, instruction, false);
+    EmitEdge(ir, locals, image, header, blocks, returns);
+    return true;
+}
+
 }
 
 std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>& blocks) {
@@ -1346,6 +1556,7 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
         const auto& block = blocks[static_cast<std::size_t>(index)];
         ir.Label(BlockLabel(block.Start));
         Locals locals(ir);
+        if (EmitCountedFill(ir, locals, image, block, blocks, returns)) continue;
         for (std::size_t insn = 0; insn < block.Insns.size(); ++insn) {
             EmitInsn(ir, locals, block.Insns[insn], flags.Dead[static_cast<std::size_t>(index)][insn] != 0);
         }
@@ -1378,6 +1589,7 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
     module += "define i64 @anyps5_guest_base() { ret i64 " + Number(image.GuestBase) + " }\n";
     module += "define i64 @anyps5_guest_limit() { ret i64 " + Number(image.GuestLimit) + " }\n";
     module += "define i32 @anyps5_memory_base() { ret i32 " + std::to_string(static_cast<std::uint32_t>(kWasmGuestBase)) + " }\n";
+    module += "define i32 @anyps5_steps_value() {\n  %value = load i32, ptr @anyps5_steps, align 4\n  ret i32 %value\n}\n";
     return module;
 }
 
