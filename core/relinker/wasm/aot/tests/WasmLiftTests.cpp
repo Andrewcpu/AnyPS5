@@ -1497,6 +1497,158 @@ process.stdout.write(String(status) + '\n' + slot.pixels.join(' ') + '\n');
     Require(pixels == first + " " + next, "second frame pixels " + pixels);
 }
 
+void AppendFill(Asm& code, std::uint64_t buffer, std::uint64_t count, std::uint32_t color, std::uint8_t step, std::uint32_t initial, bool overlap) {
+    code.B({0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x30});
+    if (overlap) code.B({0x48, 0x8d, 0x45, 0xdc});
+    else {
+        code.B({0x48, 0xb8});
+        code.U64(buffer);
+    }
+    code.B({0x48, 0x89, 0x45, 0xf0, 0x48, 0xb8});
+    code.U64(count);
+    code.B({0x48, 0x89, 0x45, 0xe8, 0xc7, 0x45, 0xe0});
+    code.U32(color);
+    code.B({0xc7, 0x45, 0xdc});
+    code.U32(initial);
+    const auto header = code.Bytes.size();
+    code.B({0x48, 0x63, 0x45, 0xdc, 0x48, 0x3b, 0x45, 0xe8, 0x0f, 0x83, 0x00, 0x00, 0x00, 0x00});
+    const auto jaeAt = code.Bytes.size() - 4;
+    code.B({0x48, 0x8b, 0x45, 0xf0, 0x48, 0x63, 0x4d, 0xdc, 0x8b, 0x55, 0xe0, 0x89, 0x14, 0x88, 0x8b, 0x45, 0xdc, 0x83, 0xc0, step, 0x89, 0x45, 0xdc, 0xe9, 0x00, 0x00, 0x00, 0x00});
+    const auto jmpAt = code.Bytes.size() - 4;
+    const auto done = code.Bytes.size();
+    code.B({0x48, 0x83, 0xc4, 0x30, 0x5d});
+    auto rel32 = [&](std::size_t at, std::size_t target) {
+        const auto disp = static_cast<std::int32_t>(static_cast<std::int64_t>(target) - static_cast<std::int64_t>(at + 4));
+        for (int index = 0; index < 4; ++index) code.Bytes[at + static_cast<std::size_t>(index)] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(disp) >> (8 * index));
+    };
+    rel32(jaeAt, done);
+    rel32(jmpAt, header);
+}
+
+void CountedFill() {
+    constexpr std::uint64_t codeVA = 0x50000;
+    constexpr std::uint32_t strideColor = 0x04030201;
+    constexpr std::uint32_t negativeColor = 0xaabbccdd;
+    constexpr std::uint32_t zeroColor = 0x01010101;
+    constexpr std::uint32_t fillColor = 0x44332211;
+    const std::uint64_t bufA = codeVA + 0x400;
+    const std::uint64_t bufB = codeVA + 0x440;
+    const std::uint64_t bufC = codeVA + 0x480;
+    const std::uint64_t bufD = codeVA + 0x4c0;
+    Asm code;
+    AppendFill(code, 0, 1, 0x11223344u, 1, 0, true);
+    AppendFill(code, bufA, 4, strideColor, 2, 0, false);
+    AppendFill(code, bufB, 10, negativeColor, 1, 0xffffffffu, false);
+    AppendFill(code, bufC, 0, zeroColor, 1, 0, false);
+    AppendFill(code, bufD, 8, fillColor, 1, 0, false);
+    Require(code.Bytes.size() < 0x400, "fill code overlaps its buffers");
+    const auto ud2 = codeVA + code.Bytes.size();
+    code.B({0x0f, 0x0b});
+    code.Bytes.resize(0x500);
+    const auto elf = Elf(codeVA, codeVA, code.Bytes);
+    Require(ModuleText(elf).find("fillloop") != std::string::npos, "counted fill was not lowered");
+    const auto run = RunGuest(elf);
+    Require(run.Native.Signal == SIGILL, "fill signal");
+    ExpectEqual("fill status", run.Status, 0);
+    ExpectEqual("fill rip", run.Rip, ud2);
+    ExpectEqual("native fill rip", run.Native.Rip, ud2);
+    for (int reg = 0; reg < 16; ++reg) ExpectEqual("fill gpr " + std::to_string(reg), run.Gpr[reg], run.Native.Gpr[reg]);
+    ExpectEqual("fill rax", run.Gpr[0], 8);
+    ExpectEqual("fill rcx", run.Gpr[1], 7);
+    ExpectEqual("fill rdx", run.Gpr[2], fillColor);
+    ExpectFlags("fill flags", run.Native.Flags, run.Flags, false);
+    auto word = [&](const std::vector<std::uint8_t>& memory, std::uint64_t address) {
+        return Read32(memory.data() + static_cast<std::size_t>(address - run.Plan.GuestBase));
+    };
+    auto expectWord = [&](const std::string& name, std::uint64_t address, std::uint32_t expected) {
+        ExpectEqual("native " + name, word(run.NativeMemory, address), expected);
+        ExpectEqual("wasm " + name, word(run.WasmMemory, address), expected);
+    };
+    expectWord("stride 0", bufA, strideColor);
+    expectWord("stride 1", bufA + 4, 0);
+    expectWord("stride 2", bufA + 8, strideColor);
+    expectWord("negative", bufB, 0);
+    expectWord("zero", bufC, 0);
+    for (int index = 0; index < 8; ++index) expectWord("pixel " + std::to_string(index), bufD + static_cast<std::uint64_t>(index) * 4, fillColor);
+    expectWord("past fill", bufD + 32, 0);
+    ExpectSameMemory(run);
+
+    constexpr std::uint64_t wideVA = 0x80000;
+    constexpr std::uint32_t wideCount = 4096;
+    constexpr std::uint32_t wideColor = 0xa1b2c3d4u;
+    const std::uint64_t wideBuf = wideVA + 0x200;
+    Asm wide;
+    AppendFill(wide, wideBuf, wideCount, wideColor, 1, 0, false);
+    Require(wide.Bytes.size() < 0x200, "wide fill overlaps its buffer");
+    wide.B({0x0f, 0x0b});
+    wide.Bytes.resize(0x200 + static_cast<std::size_t>(wideCount) * 4 + 4);
+    const auto wideElf = Elf(wideVA, wideVA, wide.Bytes);
+    const auto wideRun = RunGuest(wideElf);
+    ExpectEqual("wide status", wideRun.Status, 0);
+    ExpectSameMemory(wideRun);
+    ExpectEqual("wide first", Read32(wideRun.WasmMemory.data() + 0x200), wideColor);
+    ExpectEqual("wide last", Read32(wideRun.WasmMemory.data() + 0x200 + (wideCount - 1) * 4), wideColor);
+    ExpectEqual("wide pad", wideRun.WasmMemory[0x200 + static_cast<std::size_t>(wideCount) * 4], 0);
+    const auto directory = std::filesystem::temp_directory_path() / ("anyps5-wasm-fill-" + std::to_string(getpid()));
+    std::filesystem::create_directories(directory);
+    const auto input = directory / "wide.elf";
+    const auto output = directory / "wide.wasm";
+    const auto script = directory / "steps.js";
+    {
+        std::ofstream elfFile(input, std::ios::binary);
+        elfFile.write(reinterpret_cast<const char*>(wideElf.data()), static_cast<std::streamsize>(wideElf.size()));
+        std::ofstream scriptFile(script);
+        scriptFile << R"(const fs = require('fs');
+const bytes = fs.readFileSync(process.argv[2]);
+const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), { env: {} });
+const status = instance.exports.anyps5_run();
+const steps = instance.exports.anyps5_steps_value();
+process.stdout.write(status + ' ' + steps + '\n');
+)";
+    }
+    const auto linked = Run({ANYPS5_RELINKER, "--wasm", input.string(), output.string()});
+    Require(linked.Status == 0, "wide relinker failed: " + linked.Err + linked.Out);
+    const auto node = Run({ANYPS5_NODE, "--liftoff-only", script.string(), output.string()});
+    Require(node.Status == 0, "wide node failed: " + node.Err + node.Out);
+    std::istringstream stepLine(node.Out);
+    std::uint64_t stepStatus = 0;
+    std::uint64_t steps = 0;
+    stepLine >> stepStatus >> steps;
+    ExpectEqual("wide liftoff status", stepStatus, 0);
+    Require(steps >= 1 && steps < 64, "wide fill counted " + std::to_string(steps) + " steps");
+    Require(steps < wideCount, "wide fill still counts a step per pixel");
+
+    Asm spin;
+    spin.B({0xeb, 0xfe, 0x0f, 0x0b});
+    const auto spinElf = Elf(0x90000, 0x90000, spin.Bytes);
+    const auto spinInput = directory / "spin.elf";
+    const auto spinOutput = directory / "spin.wasm";
+    const auto spinScript = directory / "spin.js";
+    {
+        std::ofstream elfFile(spinInput, std::ios::binary);
+        elfFile.write(reinterpret_cast<const char*>(spinElf.data()), static_cast<std::streamsize>(spinElf.size()));
+        std::ofstream scriptFile(spinScript);
+        scriptFile << R"(const fs = require('fs');
+const bytes = fs.readFileSync(process.argv[2]);
+const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), { env: {} });
+const status = instance.exports.anyps5_run();
+const steps = instance.exports.anyps5_steps_value();
+process.stdout.write(status + ' ' + steps + '\n');
+)";
+    }
+    const auto spinLinked = Run({ANYPS5_RELINKER, "--wasm", spinInput.string(), spinOutput.string()});
+    Require(spinLinked.Status == 0, "spin relinker failed: " + spinLinked.Err + spinLinked.Out);
+    const auto spinNode = Run({ANYPS5_NODE, "--liftoff-only", spinScript.string(), spinOutput.string()});
+    Require(spinNode.Status == 0, "spin node failed: " + spinNode.Err + spinNode.Out);
+    std::istringstream spinLine(spinNode.Out);
+    std::uint64_t spinStatus = 0;
+    std::uint64_t spinSteps = 0;
+    spinLine >> spinStatus >> spinSteps;
+    ExpectEqual("spin status", spinStatus, 3);
+    ExpectEqual("spin steps", spinSteps, Relinker::Wasm::kStepLimit);
+    std::filesystem::remove_all(directory);
+}
+
 void WebGpu() {
     const auto checked = Run({ANYPS5_NODE, ANYPS5_WEBGPU_RUN, "check"});
     Require(checked.Status == 0 && checked.Out.find("ok") != std::string::npos, "shader check failed: " + checked.Err + checked.Out);
@@ -1668,6 +1820,7 @@ int main() {
         Optimized();
         Imports();
         SecondFrame();
+        CountedFill();
         WebGpu();
         Forms();
     } catch (const std::exception& error) {
