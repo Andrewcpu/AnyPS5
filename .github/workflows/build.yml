@@ -360,9 +360,6 @@ jobs:
       - run: cmake -S . -B build-relinker -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON -DCMAKE_OSX_ARCHITECTURES=${{ matrix.architectures }}
       - run: cmake --build build-relinker --parallel 3
       - run: |
-          if [ "$RUNNER_OS" = macOS ]; then
-            python3 -c 'import re, sys; from pathlib import Path; p = Path("build-relinker/CTestTestfile.cmake"); t = p.read_text(); u, n = re.subn(r"(set_tests_properties\((?:\[=\[performance_bisect\]=\]|performance_bisect) PROPERTIES\s+)TIMEOUT\s+\"?20\"?", "\\1TIMEOUT " + chr(34) + "60" + chr(34), t, count=1); sys.exit("performance_bisect timeout was not updated") if n != 1 else p.write_text(u)'
-          fi
           repeat=()
           if [ "$RUNNER_OS" = Windows ] || [ "$RUNNER_OS" = macOS ]; then repeat=(--repeat after-timeout:2); fi
           ctest --test-dir build-relinker --output-on-failure --timeout 120 --parallel 4 --no-tests=error "${repeat[@]}" --output-log ctest.log

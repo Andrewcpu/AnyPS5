@@ -480,7 +480,7 @@ if(BUILD_TESTING)
         set_tests_properties(performance_csv PROPERTIES TIMEOUT 20)
         add_test(NAME performance_bisect COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_performance_bisect.py)
-        set_tests_properties(performance_bisect PROPERTIES TIMEOUT 20)
+        set_tests_properties(performance_bisect PROPERTIES TIMEOUT 60)
         add_test(NAME emsdk_pin COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_emsdk_pin.py)
         set_tests_properties(emsdk_pin PROPERTIES TIMEOUT 20)
