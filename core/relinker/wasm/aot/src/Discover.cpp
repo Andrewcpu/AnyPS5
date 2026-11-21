@@ -56,13 +56,13 @@ std::uint64_t ResolveSlot(const WasmImage& image, const WasmInsn& insn) {
     if (!insn.Src.Rip) Fail("indirect branch is not lifted");
     const auto slot = insn.Next + static_cast<std::uint64_t>(insn.Src.Disp);
     const auto value = ReadQword(image, slot);
-    if (ImportEntry(image, value) || Executable(image, value)) return value;
+    if (ImportEntry(image, value) || Executable(image, value) || value < image.GuestBase || value >= image.GuestLimit) return value;
     Fail("indirect branch target is not an import");
     return 0;
 }
 
 void AddTarget(const WasmImage& image, std::set<std::uint64_t>& extra, std::uint64_t target) {
-    if (ImportEntry(image, target)) return;
+    if (ImportEntry(image, target) || target < image.GuestBase || target >= image.GuestLimit) return;
     extra.insert(target);
 }
 

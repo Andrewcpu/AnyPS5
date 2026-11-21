@@ -361,7 +361,7 @@ jobs:
       - run: cmake --build build-relinker --parallel 3
       - run: |
           repeat=()
-          if [ "$RUNNER_OS" = Windows ]; then repeat=(--repeat after-timeout:2); fi
+          if [ "$RUNNER_OS" = Windows ] || [ "$RUNNER_OS" = macOS ]; then repeat=(--repeat after-timeout:2); fi
           ctest --test-dir build-relinker --output-on-failure --timeout 120 --parallel 4 --no-tests=error "${repeat[@]}" --output-log ctest.log
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}

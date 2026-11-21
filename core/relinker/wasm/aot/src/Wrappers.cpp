@@ -37,10 +37,10 @@ std::string Helpers(std::uint64_t guestBase, std::uint64_t guestLimit) {
     text += "define internal i32 @anyps5_guest_return() {\nentry:\n";
     text += "  %rsp = load i64, ptr " + Gpr(kRsp) + ", align 1\n";
     text += "  %bad = call i32 @anyps5_span_ok(i64 %rsp, i64 8)\n  %faulted = icmp ne i32 %bad, 0\n";
-    text += "  br i1 %faulted, label %fail, label %ok\nok:\n";
+    text += "  br i1 %faulted, label %leave, label %ok\nok:\n";
     text += "  %wasm = call i32 @anyps5_translate(i64 %rsp)\n  %next = call i64 @anyps5_read64(i32 %wasm)\n";
     text += "  %raised = add i64 %rsp, 8\n  store i64 %raised, ptr " + Gpr(kRsp) + ", align 1\n";
-    text += "  store i64 %next, ptr " + State(kRipOffset) + ", align 1\n  ret i32 0\nfail:\n  ret i32 1\n}\n";
+    text += "  store i64 %next, ptr " + State(kRipOffset) + ", align 1\n  ret i32 0\nleave:\n  ret i32 2\n}\n";
     text += "define internal i32 @anyps5_copy(i64 %dst, i64 %src, i64 %n) {\nentry:\n";
     text += "  %dstbad = call i32 @anyps5_span_ok(i64 %dst, i64 %n)\n  %srcbad = call i32 @anyps5_span_ok(i64 %src, i64 %n)\n";
     text += "  %db = icmp ne i32 %dstbad, 0\n  %sb = icmp ne i32 %srcbad, 0\n  %bad = or i1 %db, %sb\n";
