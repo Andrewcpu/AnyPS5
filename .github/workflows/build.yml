@@ -361,14 +361,7 @@ jobs:
       - run: cmake --build build-relinker --parallel 3
       - run: |
           if [ "$RUNNER_OS" = macOS ]; then
-            python3 -c 'from pathlib import Path
-import re
-path = Path("build-relinker/CTestTestfile.cmake")
-text = path.read_text()
-updated, count = re.subn(r"(set_tests_properties\((?:\[=\[performance_bisect\]=\]|performance_bisect) PROPERTIES\s+)TIMEOUT\s+\"?20\"?", "\\1TIMEOUT " + chr(34) + "60" + chr(34), text, count=1)
-if count != 1:
-    raise SystemExit("performance_bisect timeout was not updated")
-path.write_text(updated)'
+            python3 -c 'import re, sys; from pathlib import Path; p = Path("build-relinker/CTestTestfile.cmake"); t = p.read_text(); u, n = re.subn(r"(set_tests_properties\((?:\[=\[performance_bisect\]=\]|performance_bisect) PROPERTIES\s+)TIMEOUT\s+\"?20\"?", "\\1TIMEOUT " + chr(34) + "60" + chr(34), t, count=1); sys.exit("performance_bisect timeout was not updated") if n != 1 else p.write_text(u)'
           fi
           repeat=()
           if [ "$RUNNER_OS" = Windows ] || [ "$RUNNER_OS" = macOS ]; then repeat=(--repeat after-timeout:2); fi
