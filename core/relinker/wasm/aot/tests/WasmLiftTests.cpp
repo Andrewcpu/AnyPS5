@@ -407,7 +407,7 @@ void ExpectFlags(const std::string& name, std::uint64_t native, std::uint64_t wa
     ExpectEqual(name, wasm & (logical ? kLogicalMask : kFlagMask), native & (logical ? kLogicalMask : kFlagMask));
 }
 
-GuestRun RunGuest(const std::vector<std::uint8_t>& elf) {
+GuestRun RunGuest(const std::vector<std::uint8_t>& elf, bool liftoff = false) {
     GuestRun run;
     run.Plan = Relinker::Wasm::PlanWasmImage(elf);
     static int serial = 0;
@@ -442,7 +442,12 @@ GuestRun RunGuest(const std::vector<std::uint8_t>& elf) {
     run.NativeMemory.resize(span);
     std::memcpy(run.NativeMemory.data(), reinterpret_cast<const void*>(run.Plan.GuestBase), span);
     munmap(mapped, static_cast<std::size_t>(limit - page));
-    const auto node = Run({ANYPS5_NODE, script.string(), output.string(), std::to_string(span)});
+    std::vector<std::string> nodeArgs = {ANYPS5_NODE};
+    if (liftoff) nodeArgs.push_back("--liftoff-only");
+    nodeArgs.push_back(script.string());
+    nodeArgs.push_back(output.string());
+    nodeArgs.push_back(std::to_string(span));
+    const auto node = Run(nodeArgs);
     std::filesystem::remove_all(directory);
     Require(node.Status == 0, "node failed: " + node.Err + node.Out);
     std::istringstream lines(node.Out);
@@ -871,6 +876,117 @@ void Fault() {
     ExpectSameMemory(run);
 }
 
+GuestRun RunWasm(const std::vector<std::uint8_t>& elf, bool liftoff = false);
+
+void OutsideTransfer() {
+    {
+        constexpr std::uint64_t base = 0x470000;
+        Asm code;
+        code.B({0xc3});
+        const auto run = RunWasm(Elf(base, base, code.Bytes), true);
+        ExpectEqual("return slot status", run.Status, 0);
+        ExpectEqual("return slot rip", run.Rip, base);
+        ExpectEqual("return slot rsp", run.Gpr[4], run.Plan.StackTop);
+    }
+    {
+        constexpr std::uint64_t base = 0x480000;
+        constexpr std::uint64_t target = 0x1111;
+        Asm code;
+        code.B({0x48, 0xb8});
+        code.U64(target);
+        code.B({0x50, 0xc3});
+        const auto run = RunWasm(Elf(base, base, code.Bytes), true);
+        ExpectEqual("return value status", run.Status, 0);
+        ExpectEqual("return value rip", run.Rip, target);
+        ExpectEqual("return value rsp", run.Gpr[4], run.Plan.StackTop);
+    }
+    {
+        constexpr std::uint64_t base = 0x490000;
+        constexpr std::uint64_t target = 0x22222222ull;
+        Asm code;
+        code.B({0x48, 0xb8});
+        code.U64(target);
+        code.B({0xff, 0xe0});
+        const auto run = RunWasm(Elf(base, base, code.Bytes), true);
+        ExpectEqual("jump register status", run.Status, 0);
+        ExpectEqual("jump register rip", run.Rip, target);
+    }
+    {
+        constexpr std::uint64_t base = 0x4a0000;
+        constexpr std::uint64_t target = 0x30;
+        Asm code;
+        code.B({0xe9});
+        code.U32(static_cast<std::uint32_t>(target - (base + 5)));
+        const auto run = RunWasm(Elf(base, base, code.Bytes), true);
+        ExpectEqual("direct jump status", run.Status, 0);
+        ExpectEqual("direct jump rip", run.Rip, target);
+    }
+    {
+        constexpr std::uint64_t base = 0x4b0000;
+        Asm code;
+        code.B({0x48, 0xb8});
+        code.U64(base + 2);
+        code.B({0x50, 0xc3});
+        const auto run = RunWasm(Elf(base, base, code.Bytes), true);
+        ExpectEqual("inside status", run.Status, 1);
+        ExpectEqual("inside rip", run.Rip, base + 2);
+    }
+    {
+        constexpr std::uint64_t base = 0x4c0000;
+        constexpr std::uint64_t target = 0x5555;
+        Asm code;
+        code.B({0x48, 0xb8});
+        code.U64(target);
+        code.B({0xff, 0xd0, 0x0f, 0x0b});
+        const auto run = RunWasm(Elf(base, base, code.Bytes), true);
+        ExpectEqual("call status", run.Status, 0);
+        ExpectEqual("call rip", run.Rip, target);
+        ExpectEqual("call rsp", run.Gpr[4], run.Plan.StackTop - 8);
+    }
+    {
+        constexpr std::uint64_t base = 0x51000000;
+        Asm code;
+        code.B({0xb8, 0x01, 0x00, 0x00, 0x00, 0x83, 0xf8, 0x00, 0x0f, 0x84});
+        const auto next = base + code.Bytes.size() + 4;
+        code.U32(static_cast<std::uint32_t>(static_cast<std::uint64_t>(0x40) - next));
+        const auto ud2 = base + code.Bytes.size();
+        code.B({0x0f, 0x0b});
+        const auto run = RunGuest(Elf(base, base, code.Bytes), true);
+        Require(run.Native.Signal == SIGILL, "kept branch signal " + std::to_string(run.Native.Signal));
+        ExpectEqual("kept branch status", run.Status, 0);
+        ExpectEqual("kept branch rip", run.Rip, ud2);
+        ExpectEqual("kept branch native rip", run.Native.Rip, ud2);
+    }
+    {
+        constexpr std::uint64_t base = 0x4e0000;
+        constexpr std::uint64_t target = 0x41;
+        Asm code;
+        code.B({0x31, 0xc0, 0x83, 0xf8, 0x00, 0x0f, 0x84});
+        const auto next = base + code.Bytes.size() + 4;
+        code.U32(static_cast<std::uint32_t>(target - next));
+        code.B({0x0f, 0x0b});
+        const auto run = RunWasm(Elf(base, base, code.Bytes), true);
+        ExpectEqual("taken branch status", run.Status, 0);
+        ExpectEqual("taken branch rip", run.Rip, target);
+    }
+    {
+        constexpr std::uint64_t base = 0x4f0000;
+        Asm code;
+        code.B({0xe9});
+        code.U32(static_cast<std::uint32_t>((base + 0x1000) - (base + 5)));
+        std::vector<std::uint8_t> data(8);
+        const auto elf = MakeElf(base, 2, {{base, 5, code.Bytes.size(), code.Bytes}, {base + 0x1000, 6, data.size(), data}}, {}, {}, false);
+        bool threw = false;
+        try {
+            (void)Relinker::Wasm::CompileWasm(elf);
+        } catch (const std::exception& error) {
+            threw = true;
+            Require(std::string(error.what()).find("executable") != std::string::npos, std::string("unexpected reject: ") + error.what());
+        }
+        Require(threw, "jump into the guest window was an exit");
+    }
+}
+
 struct DynImport {
     std::string Name;
     std::uint64_t Slot = 0;
@@ -963,7 +1079,7 @@ std::vector<std::uint8_t> DynamicElf(std::uint64_t codeVA, const std::vector<std
     return elf;
 }
 
-GuestRun RunWasm(const std::vector<std::uint8_t>& elf) {
+GuestRun RunWasm(const std::vector<std::uint8_t>& elf, bool liftoff) {
     GuestRun run;
     run.Plan = Relinker::Wasm::PlanWasmImage(elf);
     static int serial = 0;
@@ -984,7 +1100,12 @@ GuestRun RunWasm(const std::vector<std::uint8_t>& elf) {
         Require(false, "relinker --wasm failed: " + linked.Err + linked.Out);
     }
     const auto span = static_cast<std::size_t>(run.Plan.GuestLimit - run.Plan.GuestBase);
-    const auto node = Run({ANYPS5_NODE, script.string(), output.string(), std::to_string(span)});
+    std::vector<std::string> nodeArgs = {ANYPS5_NODE};
+    if (liftoff) nodeArgs.push_back("--liftoff-only");
+    nodeArgs.push_back(script.string());
+    nodeArgs.push_back(output.string());
+    nodeArgs.push_back(std::to_string(span));
+    const auto node = Run(nodeArgs);
     std::filesystem::remove_all(directory);
     Require(node.Status == 0, "node failed: " + node.Err + node.Out);
     std::istringstream lines(node.Out);
@@ -1817,6 +1938,7 @@ int main() {
         Flags();
         GuestMemory();
         Fault();
+        OutsideTransfer();
         Optimized();
         Imports();
         SecondFrame();

@@ -298,8 +298,7 @@ public:
     void StoreXmm(int reg, int half, const std::string& value) { Store("i64", value, StatePtr(kXmmOffset + static_cast<std::uint64_t>(reg) * 16 + static_cast<std::uint64_t>(half) * 8)); }
     void StoreRip(const std::string& value) { Store("i64", value, StatePtr(kRipOffset)); }
 
-    void Guard(const std::string& address, int size, std::uint64_t rip) {
-        StoreRip(Const(rip));
+    std::string Rejected(const std::string& address, int size) {
         const auto end = Add(address, Const(static_cast<std::uint64_t>(size)));
         const auto wrap = Icmp("ult", end, address);
         const auto below = Icmp("ult", address, Const(guestBase));
@@ -309,7 +308,12 @@ public:
         const auto heapBelow = Icmp("ult", address, Const(guestBase + kMemoryBytes));
         const auto heapAbove = Icmp("ugt", end, directEnd);
         const auto outside = BitOp("or", BitOp("or", wrap, heapBelow), heapAbove);
-        const auto bad = BitOp("and", image, outside);
+        return BitOp("and", image, outside);
+    }
+
+    void Guard(const std::string& address, int size, std::uint64_t rip) {
+        StoreRip(Const(rip));
+        const auto bad = Rejected(address, size);
         const auto ok = "ok" + std::to_string(label++);
         Line("br i1 " + bad + ", label %fault, label %" + ok);
         Label(ok);
@@ -1118,17 +1122,25 @@ void EmitTick(Ir& ir) {
     ir.Line("store i32 " + advanced + ", ptr @anyps5_steps, align 4");
 }
 
+void EmitImportResult(Ir& ir, const std::string& status, const std::string& ok) {
+    const auto leave = ir.Icmp("eq", status, "2", "i32");
+    const auto stayed = ir.NextLabel("stay");
+    ir.Line("br i1 " + leave + ", label %halt, label %" + stayed);
+    ir.Label(stayed);
+    const auto bad = ir.Icmp("ne", status, "0", "i32");
+    ir.Line("br i1 " + bad + ", label %fault, label %" + ok);
+}
+
 void EmitImport(Ir& ir, const WasmImage& image, int import, std::uint64_t fall, bool resume) {
     ir.StoreRip(ir.Const(image.Imports[static_cast<std::size_t>(import)].Entry));
     const auto status = ir.Temp();
     ir.Line(status + " = call i32 @anyps5_import_" + std::to_string(image.Imports[static_cast<std::size_t>(import)].Kind) + "()");
-    const auto bad = ir.Icmp("ne", status, "0", "i32");
     if (!resume) {
-        ir.Line("br i1 " + bad + ", label %fault, label %dispatch");
+        EmitImportResult(ir, status, "dispatch");
         return;
     }
     const auto back = ir.NextLabel("back");
-    ir.Line("br i1 " + bad + ", label %fault, label %" + back);
+    EmitImportResult(ir, status, back);
     ir.Label(back);
     const auto rip = ir.Load("i64", ir.StatePtr(kRipOffset));
     const auto same = ir.Icmp("eq", rip, ir.Const(fall));
@@ -1215,6 +1227,12 @@ void EmitEdge(Ir& ir, Locals& locals, const WasmImage& image, const WasmBlock& b
         return;
     }
     const auto rsp = locals.Read(kRsp);
+    const auto unmapped = ir.Rejected(rsp, 8);
+    locals.Spill();
+    ir.StoreRip(ir.Const(block.Edge));
+    const auto pop = ir.NextLabel("pop");
+    ir.Line("br i1 " + unmapped + ", label %halt, label %" + pop);
+    ir.Label(pop);
     const auto next = LoadMem(ir, locals, rsp, 64, block.Edge);
     locals.Write(kRsp, ir.Add(rsp, ir.Const(8)));
     locals.Spill();
@@ -1572,12 +1590,17 @@ std::string EmitWasmModule(const WasmImage& image, const std::vector<WasmBlock>&
         EmitTick(ir);
         const auto status = ir.Temp();
         ir.Line(status + " = call i32 @anyps5_import_" + std::to_string(image.Imports[index].Kind) + "()");
-        const auto bad = ir.Icmp("ne", status, "0", "i32");
-        ir.Line("br i1 " + bad + ", label %fault, label %dispatch");
+        EmitImportResult(ir, status, "dispatch");
     }
     ir.Label("halt");
     ir.Line("ret i32 0");
     ir.Label("missing");
+    const auto below = ir.Icmp("ult", rip, ir.Const(image.GuestBase));
+    const auto above = ir.Icmp("uge", rip, ir.Const(image.GuestLimit));
+    const auto outside = ir.BitOp("or", below, above);
+    const auto gone = ir.NextLabel("miss");
+    ir.Line("br i1 " + outside + ", label %halt, label %" + gone);
+    ir.Label(gone);
     ir.Line("ret i32 1");
     ir.Label("fault");
     ir.Line("ret i32 2");
